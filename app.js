@@ -28,7 +28,6 @@ process.on('uncaughtException', function(e) {
     console.error('Error: ' + e);
 });
 
-var httpserv;
 
 var app = express();
 app.get('/course/:course', function(req, res) {
@@ -37,7 +36,7 @@ app.get('/course/:course', function(req, res) {
 });
 app.use('/', express.static(path.join(__dirname, 'public')));
 
-httpserv = http.createServer(app).listen(opts.port, function() {
+var httpserv = http.createServer(app).listen(opts.port, function() {
     console.log('http on port ' + opts.port);
 });
 
