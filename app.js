@@ -32,7 +32,7 @@ process.on('uncaughtException', function(e) {
 var app = express();
 app.get('/course/:course', function(req, res) {
   var course = req.params.course;
-  res.sendfile(__dirname + '/public/wetty/index.html');
+  res.sendfile(__dirname + '/public/index.html');
 });
 app.use('/', express.static(path.join(__dirname, 'public')));
 
@@ -40,16 +40,16 @@ var httpserv = http.createServer(app).listen(opts.port, function() {
     console.log('http on port ' + opts.port);
 });
 
-var io = server(httpserv,{path: '/wetty/socket.io'});
+var io = server(httpserv);
 io.on('connection', function(socket){
     var request = socket.request;
     if (match = request.headers.referer.match('/course/.+$')) {
-      command = match[0].replace('/course/', '');
+      command =  match[0].replace('/course/', '');
     }
     console.log((new Date()) + ' Connection accepted.');
 
     var term;
-    term = pty.spawn(command, [], {
+    term = pty.spawn("/usr/local/bin/selfpaced.sh", [command], {
         name: 'xterm-256color',
         cols: 80,
         rows: 30
