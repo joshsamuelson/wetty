@@ -44,12 +44,12 @@ var io = server(httpserv);
 io.on('connection', function(socket){
     var request = socket.request;
     if (match = request.headers.referer.match('/course/.+$')) {
-      command =  match[0].replace('/course/', '');
+      course =  match[0].replace('/course/', '');
     }
     console.log((new Date()) + ' Connection accepted.');
 
     var term;
-    term = pty.spawn("/usr/local/bin/selfpaced.sh", [command], {
+    term = pty.spawn(command, [course], {
         name: 'xterm-256color',
         cols: 80,
         rows: 30
