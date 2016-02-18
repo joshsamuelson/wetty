@@ -5,6 +5,7 @@ var path = require('path');
 var server = require('socket.io');
 var pty = require('pty.js');
 var fs = require('fs');
+var shellquote = require('shell-quote');
 
 var opts = require('optimist')
     .options({
@@ -113,7 +114,9 @@ io.on('connection', function(socket){
 
     var term;
     if (process.getuid() == 0 || opts.command) {
-        term = pty.spawn(command, [], {
+        var args = shellquote.parse(command);
+        var entrypoint = args.shift();
+        term = pty.spawn(entrypoint, args, {
             name: 'xterm-256color',
             cols: 80,
             rows: 30
