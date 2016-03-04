@@ -43,6 +43,7 @@ var httpserv = http.createServer(app).listen(opts.port, function() {
 var io = server(httpserv);
 io.on('connection', function(socket){
     var request = socket.request;
+    var course = 'default';
     if (match = request.headers.referer.match('/course/.+$')) {
       course =  match[0].replace('/course/', '');
     }
