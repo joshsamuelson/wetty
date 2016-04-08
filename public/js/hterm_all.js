@@ -3,6 +3,19 @@
 // than edit it directly, please modify one of these source
 // files...
 //
+// libdot/js/lib.js
+// libdot/js/lib_colors.js
+// libdot/js/lib_f.js
+// libdot/js/lib_message_manager.js
+// libdot/js/lib_preference_manager.js
+// libdot/js/lib_resource.js
+// libdot/js/lib_storage.js
+// libdot/js/lib_storage_chrome.js
+// libdot/js/lib_storage_local.js
+// libdot/js/lib_storage_memory.js
+// libdot/js/lib_test_manager.js
+// libdot/js/lib_utf8.js
+// libdot/js/lib_wc.js
 // hterm/js/hterm.js
 // hterm/js/hterm_frame.js
 // hterm/js/hterm_keyboard.js
@@ -19,6 +32,4842 @@
 // hterm/js/hterm_vt_character_map.js
 //
 
+// SOURCE FILE: libdot/js/lib.js
+// Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+'use strict';
+
+if (typeof lib != 'undefined')
+  throw new Error('Global "lib" object already exists.');
+
+var lib = {};
+
+/**
+ * Map of "dependency" to ["source", ...].
+ *
+ * Each dependency is a object name, like "lib.fs", "source" is the url that
+ * depdends on the object.
+ */
+lib.runtimeDependencies_ = {};
+
+/**
+ * List of functions that need to be invoked during library initialization.
+ *
+ * Each element in the initCallbacks_ array is itself a two-element array.
+ * Element 0 is a short string describing the owner of the init routine, useful
+ * for debugging.  Element 1 is the callback function.
+ */
+lib.initCallbacks_ = [];
+
+/**
+ * Records a runtime dependency.
+ *
+ * This can be useful when you want to express a run-time dependency at
+ * compile time.  It is not intended to be a full-fledged library system or
+ * dependency tracker.  It's just there to make it possible to debug the
+ * deps without running all the code.
+ *
+ * Object names are specified as strings.  For example...
+ *
+ *     lib.rtdep('lib.colors', 'lib.PreferenceManager');
+ *
+ * Object names need not be rooted by 'lib'.  You may use this to declare a
+ * dependency on any object.
+ *
+ * The client program may call lib.ensureRuntimeDependencies() at startup in
+ * order to ensure that all runtime dependencies have been met.
+ *
+ * @param {string} var_args One or more objects specified as strings.
+ */
+lib.rtdep = function(var_args) {
+  var source;
+
+  try {
+    throw new Error();
+  } catch (ex) {
+    var stackArray = ex.stack.split('\n');
+    // In Safari, the resulting stackArray will only have 2 elements and the
+    // individual strings are formatted differently.
+    if (stackArray.length >= 3) {
+      source = stackArray[2].replace(/^\s*at\s+/, '');
+    } else {
+      source = stackArray[1].replace(/^\s*global code@/, '');
+    }
+  }
+
+  for (var i = 0; i < arguments.length; i++) {
+    var path = arguments[i];
+    if (path instanceof Array) {
+      lib.rtdep.apply(lib, path);
+    } else {
+      var ary = this.runtimeDependencies_[path];
+      if (!ary)
+        ary = this.runtimeDependencies_[path] = [];
+      ary.push(source);
+    }
+  }
+};
+
+/**
+ * Ensures that all runtime dependencies are met, or an exception is thrown.
+ *
+ * Every unmet runtime dependency will be logged to the JS console.  If at
+ * least one dependency is unmet this will raise an exception.
+ */
+lib.ensureRuntimeDependencies_ = function() {
+  var passed = true;
+
+  for (var path in lib.runtimeDependencies_) {
+    var sourceList = lib.runtimeDependencies_[path];
+    var names = path.split('.');
+
+    // In a document context 'window' is the global object.  In a worker it's
+    // called 'self'.
+    var obj = (window || self);
+    for (var i = 0; i < names.length; i++) {
+      if (!(names[i] in obj)) {
+        console.warn('Missing "' + path + '" is needed by', sourceList);
+        passed = false;
+        break;
+      }
+
+      obj = obj[names[i]];
+    }
+  }
+
+  if (!passed)
+    throw new Error('Failed runtime dependency check');
+};
+
+/**
+ * Register an initialization function.
+ *
+ * The initialization functions are invoked in registration order when
+ * lib.init() is invoked.  Each function will receive a single parameter, which
+ * is a function to be invoked when it completes its part of the initialization.
+ *
+ * @param {string} name A short descriptive name of the init routine useful for
+ *     debugging.
+ * @param {function(function)} callback The initialization function to register.
+ * @return {function} The callback parameter.
+ */
+lib.registerInit = function(name, callback) {
+  lib.initCallbacks_.push([name, callback]);
+  return callback;
+};
+
+/**
+ * Initialize the library.
+ *
+ * This will ensure that all registered runtime dependencies are met, and
+ * invoke any registered initialization functions.
+ *
+ * Initialization is asynchronous.  The library is not ready for use until
+ * the onInit function is invoked.
+ *
+ * @param {function()} onInit The function to invoke when initialization is
+ *     complete.
+ * @param {function(*)} opt_logFunction An optional function to send
+ *     initialization related log messages to.
+ */
+lib.init = function(onInit, opt_logFunction) {
+  var ary = lib.initCallbacks_;
+
+  var initNext = function() {
+    if (ary.length) {
+      var rec = ary.shift();
+      if (opt_logFunction)
+        opt_logFunction('init: ' + rec[0]);
+      rec[1](lib.f.alarm(initNext));
+    } else {
+      onInit();
+    }
+  };
+
+  if (typeof onInit != 'function')
+    throw new Error('Missing or invalid argument: onInit');
+
+  lib.ensureRuntimeDependencies_();
+
+  setTimeout(initNext, 0);
+};
+// SOURCE FILE: libdot/js/lib_colors.js
+// Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+'use strict';
+
+/**
+ * Namespace for color utilities.
+ */
+lib.colors = {};
+
+/**
+ * First, some canned regular expressions we're going to use in this file.
+ *
+ *
+ *                              BRACE YOURSELF
+ *
+ *                                 ,~~~~.
+ *                                 |>_< ~~
+ *                                3`---'-/.
+ *                                3:::::\v\
+ *                               =o=:::::\,\
+ *                                | :::::\,,\
+ *
+ *                        THE REGULAR EXPRESSIONS
+ *                               ARE COMING.
+ *
+ * There's no way to break long RE literals in JavaScript.  Fix that why don't
+ * you?  Oh, and also there's no way to write a string that doesn't interpret
+ * escapes.
+ *
+ * Instead, we stoop to this .replace() trick.
+ */
+lib.colors.re_ = {
+  // CSS hex color, #RGB.
+  hex16: /#([a-f0-9])([a-f0-9])([a-f0-9])/i,
+
+  // CSS hex color, #RRGGBB.
+  hex24: /#([a-f0-9]{2})([a-f0-9]{2})([a-f0-9]{2})/i,
+
+  // CSS rgb color, rgb(rrr,ggg,bbb).
+  rgb: new RegExp(
+      ('^/s*rgb/s*/(/s*(/d{1,3})/s*,/s*(/d{1,3})/s*,' +
+       '/s*(/d{1,3})/s*/)/s*$'
+       ).replace(/\//g, '\\'), 'i'),
+
+  // CSS rgb color, rgb(rrr,ggg,bbb,aaa).
+  rgba: new RegExp(
+      ('^/s*rgba/s*' +
+       '/(/s*(/d{1,3})/s*,/s*(/d{1,3})/s*,/s*(/d{1,3})/s*' +
+       '(?:,/s*(/d+(?:/./d+)?)/s*)/)/s*$'
+       ).replace(/\//g, '\\'), 'i'),
+
+  // Either RGB or RGBA.
+  rgbx: new RegExp(
+      ('^/s*rgba?/s*' +
+       '/(/s*(/d{1,3})/s*,/s*(/d{1,3})/s*,/s*(/d{1,3})/s*' +
+       '(?:,/s*(/d+(?:/./d+)?)/s*)?/)/s*$'
+       ).replace(/\//g, '\\'), 'i'),
+
+  // An X11 "rgb:ddd/ddd/ddd" value.
+  x11rgb: /^\s*rgb:([a-f0-9]{1,4})\/([a-f0-9]{1,4})\/([a-f0-9]{1,4})\s*$/i,
+
+  // English color name.
+  name: /[a-z][a-z0-9\s]+/,
+};
+
+/**
+ * Convert a CSS rgb(ddd,ddd,ddd) color value into an X11 color value.
+ *
+ * Other CSS color values are ignored to ensure sanitary data handling.
+ *
+ * Each 'ddd' component is a one byte value specified in decimal.
+ *
+ * @param {string} value The CSS color value to convert.
+ * @return {string} The X11 color value or null if the value could not be
+ *     converted.
+ */
+lib.colors.rgbToX11 = function(value) {
+  function scale(v) {
+    v = (Math.min(v, 255) * 257).toString(16);
+    while (v.length < 4)
+      v = '0' + v;
+
+    return v;
+  }
+
+  var ary = value.match(lib.colors.re_.rgbx);
+  if (!ary)
+    return null;
+
+  return 'rgb:' + scale(ary[1]) + '/' + scale(ary[2]) + '/' + scale(ary[3]);
+};
+
+/**
+ * Convert an X11 color value into an CSS rgb(...) color value.
+ *
+ * The X11 value may be an X11 color name, or an RGB value of the form
+ * rgb:hhhh/hhhh/hhhh.  If a component value is less than 4 digits it is
+ * padded out to 4, then scaled down to fit in a single byte.
+ *
+ * @param {string} value The X11 color value to convert.
+ * @return {string} The CSS color value or null if the value could not be
+ *     converted.
+ */
+lib.colors.x11ToCSS = function(v) {
+  function scale(v) {
+    // Pad out values with less than four digits.  This padding (probably)
+    // matches xterm.  It's difficult to say for sure since xterm seems to
+    // arrive at a padded value and then perform some combination of
+    // gamma correction, color space tranformation, and quantization.
+
+    if (v.length == 1) {
+      // Single digits pad out to four by repeating the character.  "f" becomes
+      // "ffff".  Scaling down a hex value of this pattern by 257 is the same
+      // as cutting off one byte.  We skip the middle step and just double
+      // the character.
+      return parseInt(v + v, 16);
+    }
+
+    if (v.length == 2) {
+      // Similar deal here.  X11 pads two digit values by repeating the
+      // byte (or scale up by 257).  Since we're going to scale it back
+      // down anyway, we can just return the original value.
+      return parseInt(v, 16);
+    }
+
+    if (v.length == 3) {
+      // Three digit values seem to be padded by repeating the final digit.
+      // e.g. 10f becomes 10ff.
+      v = v + v.substr(2);
+    }
+
+    // Scale down the 2 byte value.
+    return Math.round(parseInt(v, 16) / 257);
+  }
+
+  var ary = v.match(lib.colors.re_.x11rgb);
+  if (!ary)
+    return lib.colors.nameToRGB(v);
+
+  ary.splice(0, 1);
+  return lib.colors.arrayToRGBA(ary.map(scale));
+};
+
+/**
+ * Converts one or more CSS '#RRGGBB' color values into their rgb(...)
+ * form.
+ *
+ * Arrays are converted in place. If a value cannot be converted, it is
+ * replaced with null.
+ *
+ * @param {string|Array.<string>} A single RGB value or array of RGB values to
+ *     convert.
+ * @return {string|Array.<string>} The converted value or values.
+ */
+lib.colors.hexToRGB = function(arg) {
+  function convert(hex) {
+    var re = (hex.length == 4) ?
+        lib.colors.re_.hex16 : lib.colors.re_.hex24;
+    var ary = hex.match(re)
+    if (!ary)
+      return null;
+
+    return 'rgb(' + parseInt(ary[1], 16) + ', ' +
+        parseInt(ary[2], 16) + ', ' +
+        parseInt(ary[3], 16) + ')';
+  }
+
+  if (arg instanceof Array) {
+    for (var i = 0; i < arg.length; i++) {
+      arg[i] = convert(arg[i]);
+    }
+  } else {
+    arg = convert(arg);
+  }
+
+  return arg;
+};
+
+/**
+ * Converts one or more CSS rgb(...) forms into their '#RRGGBB' color values.
+ *
+ * If given an rgba(...) form, the alpha field is thrown away.
+ *
+ * Arrays are converted in place. If a value cannot be converted, it is
+ * replaced with null.
+ *
+ * @param {string|Array.<string>} A single rgb(...) value or array of rgb(...)
+ *     values to convert.
+ * @return {string|Array.<string>} The converted value or values.
+ */
+lib.colors.rgbToHex = function(arg) {
+  function convert(rgb) {
+    var ary = lib.colors.crackRGB(rgb);
+    return '#' + lib.f.zpad(((parseInt(ary[0]) << 16) |
+                             (parseInt(ary[1]) <<  8) |
+                             (parseInt(ary[2]) <<  0)).toString(16), 6);
+  }
+
+  if (arg instanceof Array) {
+    for (var i = 0; i < arg.length; i++) {
+      arg[i] = convert(arg[i]);
+    }
+  } else {
+    arg = convert(arg);
+  }
+
+  return arg;
+};
+
+/**
+ * Take any valid css color definition and turn it into an rgb or rgba value.
+ *
+ * Returns null if the value could not be normalized.
+ */
+lib.colors.normalizeCSS = function(def) {
+  if (def.substr(0, 1) == '#')
+    return lib.colors.hexToRGB(def);
+
+  if (lib.colors.re_.rgbx.test(def))
+    return def;
+
+  return lib.colors.nameToRGB(def);
+};
+
+/**
+ * Convert a 3 or 4 element array into an rgba(...) string.
+ */
+lib.colors.arrayToRGBA = function(ary) {
+  var alpha = (ary.length > 3) ? ary[3] : 1;
+  return 'rgba(' + ary[0] + ', ' + ary[1] + ', ' + ary[2] + ', ' + alpha + ')';
+};
+
+/**
+ * Overwrite the alpha channel of an rgb/rgba color.
+ */
+lib.colors.setAlpha = function(rgb, alpha) {
+  var ary = lib.colors.crackRGB(rgb);
+  ary[3] = alpha;
+  return lib.colors.arrayToRGBA(ary);
+};
+
+/**
+ * Mix a percentage of a tint color into a base color.
+ */
+lib.colors.mix = function(base, tint, percent) {
+  var ary1 = lib.colors.crackRGB(base);
+  var ary2 = lib.colors.crackRGB(tint);
+
+  for (var i = 0; i < 4; ++i) {
+    var diff = ary2[i] - ary1[i];
+    ary1[i] = Math.round(parseInt(ary1[i]) + diff * percent);
+  }
+
+  return lib.colors.arrayToRGBA(ary1);
+};
+
+/**
+ * Split an rgb/rgba color into an array of its components.
+ *
+ * On success, a 4 element array will be returned.  For rgb values, the alpha
+ * will be set to 1.
+ */
+lib.colors.crackRGB = function(color) {
+  if (color.substr(0, 4) == 'rgba') {
+    var ary = color.match(lib.colors.re_.rgba);
+    if (ary) {
+      ary.shift();
+      return ary;
+    }
+  } else {
+    var ary = color.match(lib.colors.re_.rgb);
+    if (ary) {
+      ary.shift();
+      ary.push(1);
+      return ary;
+    }
+  }
+
+  console.error('Couldn\'t crack: ' + color);
+  return null;
+};
+
+/**
+ * Convert an X11 color name into a CSS rgb(...) value.
+ *
+ * Names are stripped of spaces and converted to lowercase.  If the name is
+ * unknown, null is returned.
+ *
+ * This list of color name to RGB mapping is derived from the stock X11
+ * rgb.txt file.
+ *
+ * @param {string} name The color name to convert.
+ * @return {string} The corresponding CSS rgb(...) value.
+ */
+lib.colors.nameToRGB = function(name) {
+  if (name in lib.colors.colorNames)
+    return lib.colors.colorNames[name];
+
+  name = name.toLowerCase();
+  if (name in lib.colors.colorNames)
+    return lib.colors.colorNames[name];
+
+  name = name.replace(/\s+/g, '');
+  if (name in lib.colors.colorNames)
+    return lib.colors.colorNames[name];
+
+  return null;
+};
+
+/**
+ * The stock color palette.
+ */
+lib.colors.stockColorPalette = lib.colors.hexToRGB
+  ([// The "ANSI 16"...
+    '#000000', '#CC0000', '#4E9A06', '#C4A000',
+    '#3465A4', '#75507B', '#06989A', '#D3D7CF',
+    '#555753', '#EF2929', '#00BA13', '#FCE94F',
+    '#729FCF', '#F200CB', '#00B5BD', '#EEEEEC',
+
+    // The 6x6 color cubes...
+    '#000000', '#00005F', '#000087', '#0000AF', '#0000D7', '#0000FF',
+    '#005F00', '#005F5F', '#005F87', '#005FAF', '#005FD7', '#005FFF',
+    '#008700', '#00875F', '#008787', '#0087AF', '#0087D7', '#0087FF',
+    '#00AF00', '#00AF5F', '#00AF87', '#00AFAF', '#00AFD7', '#00AFFF',
+    '#00D700', '#00D75F', '#00D787', '#00D7AF', '#00D7D7', '#00D7FF',
+    '#00FF00', '#00FF5F', '#00FF87', '#00FFAF', '#00FFD7', '#00FFFF',
+
+    '#5F0000', '#5F005F', '#5F0087', '#5F00AF', '#5F00D7', '#5F00FF',
+    '#5F5F00', '#5F5F5F', '#5F5F87', '#5F5FAF', '#5F5FD7', '#5F5FFF',
+    '#5F8700', '#5F875F', '#5F8787', '#5F87AF', '#5F87D7', '#5F87FF',
+    '#5FAF00', '#5FAF5F', '#5FAF87', '#5FAFAF', '#5FAFD7', '#5FAFFF',
+    '#5FD700', '#5FD75F', '#5FD787', '#5FD7AF', '#5FD7D7', '#5FD7FF',
+    '#5FFF00', '#5FFF5F', '#5FFF87', '#5FFFAF', '#5FFFD7', '#5FFFFF',
+
+    '#870000', '#87005F', '#870087', '#8700AF', '#8700D7', '#8700FF',
+    '#875F00', '#875F5F', '#875F87', '#875FAF', '#875FD7', '#875FFF',
+    '#878700', '#87875F', '#878787', '#8787AF', '#8787D7', '#8787FF',
+    '#87AF00', '#87AF5F', '#87AF87', '#87AFAF', '#87AFD7', '#87AFFF',
+    '#87D700', '#87D75F', '#87D787', '#87D7AF', '#87D7D7', '#87D7FF',
+    '#87FF00', '#87FF5F', '#87FF87', '#87FFAF', '#87FFD7', '#87FFFF',
+
+    '#AF0000', '#AF005F', '#AF0087', '#AF00AF', '#AF00D7', '#AF00FF',
+    '#AF5F00', '#AF5F5F', '#AF5F87', '#AF5FAF', '#AF5FD7', '#AF5FFF',
+    '#AF8700', '#AF875F', '#AF8787', '#AF87AF', '#AF87D7', '#AF87FF',
+    '#AFAF00', '#AFAF5F', '#AFAF87', '#AFAFAF', '#AFAFD7', '#AFAFFF',
+    '#AFD700', '#AFD75F', '#AFD787', '#AFD7AF', '#AFD7D7', '#AFD7FF',
+    '#AFFF00', '#AFFF5F', '#AFFF87', '#AFFFAF', '#AFFFD7', '#AFFFFF',
+
+    '#D70000', '#D7005F', '#D70087', '#D700AF', '#D700D7', '#D700FF',
+    '#D75F00', '#D75F5F', '#D75F87', '#D75FAF', '#D75FD7', '#D75FFF',
+    '#D78700', '#D7875F', '#D78787', '#D787AF', '#D787D7', '#D787FF',
+    '#D7AF00', '#D7AF5F', '#D7AF87', '#D7AFAF', '#D7AFD7', '#D7AFFF',
+    '#D7D700', '#D7D75F', '#D7D787', '#D7D7AF', '#D7D7D7', '#D7D7FF',
+    '#D7FF00', '#D7FF5F', '#D7FF87', '#D7FFAF', '#D7FFD7', '#D7FFFF',
+
+    '#FF0000', '#FF005F', '#FF0087', '#FF00AF', '#FF00D7', '#FF00FF',
+    '#FF5F00', '#FF5F5F', '#FF5F87', '#FF5FAF', '#FF5FD7', '#FF5FFF',
+    '#FF8700', '#FF875F', '#FF8787', '#FF87AF', '#FF87D7', '#FF87FF',
+    '#FFAF00', '#FFAF5F', '#FFAF87', '#FFAFAF', '#FFAFD7', '#FFAFFF',
+    '#FFD700', '#FFD75F', '#FFD787', '#FFD7AF', '#FFD7D7', '#FFD7FF',
+    '#FFFF00', '#FFFF5F', '#FFFF87', '#FFFFAF', '#FFFFD7', '#FFFFFF',
+
+    // The greyscale ramp...
+    '#080808', '#121212', '#1C1C1C', '#262626', '#303030', '#3A3A3A',
+    '#444444', '#4E4E4E', '#585858', '#626262', '#6C6C6C', '#767676',
+    '#808080', '#8A8A8A', '#949494', '#9E9E9E', '#A8A8A8', '#B2B2B2',
+    '#BCBCBC', '#C6C6C6', '#D0D0D0', '#DADADA', '#E4E4E4', '#EEEEEE'
+   ]);
+
+/**
+ * The current color palette, possibly with user changes.
+ */
+lib.colors.colorPalette = lib.colors.stockColorPalette;
+
+/**
+ * Named colors according to the stock X11 rgb.txt file.
+ */
+lib.colors.colorNames = {
+  "aliceblue": "rgb(240, 248, 255)",
+  "antiquewhite": "rgb(250, 235, 215)",
+  "antiquewhite1": "rgb(255, 239, 219)",
+  "antiquewhite2": "rgb(238, 223, 204)",
+  "antiquewhite3": "rgb(205, 192, 176)",
+  "antiquewhite4": "rgb(139, 131, 120)",
+  "aquamarine": "rgb(127, 255, 212)",
+  "aquamarine1": "rgb(127, 255, 212)",
+  "aquamarine2": "rgb(118, 238, 198)",
+  "aquamarine3": "rgb(102, 205, 170)",
+  "aquamarine4": "rgb(69, 139, 116)",
+  "azure": "rgb(240, 255, 255)",
+  "azure1": "rgb(240, 255, 255)",
+  "azure2": "rgb(224, 238, 238)",
+  "azure3": "rgb(193, 205, 205)",
+  "azure4": "rgb(131, 139, 139)",
+  "beige": "rgb(245, 245, 220)",
+  "bisque": "rgb(255, 228, 196)",
+  "bisque1": "rgb(255, 228, 196)",
+  "bisque2": "rgb(238, 213, 183)",
+  "bisque3": "rgb(205, 183, 158)",
+  "bisque4": "rgb(139, 125, 107)",
+  "black": "rgb(0, 0, 0)",
+  "blanchedalmond": "rgb(255, 235, 205)",
+  "blue": "rgb(0, 0, 255)",
+  "blue1": "rgb(0, 0, 255)",
+  "blue2": "rgb(0, 0, 238)",
+  "blue3": "rgb(0, 0, 205)",
+  "blue4": "rgb(0, 0, 139)",
+  "blueviolet": "rgb(138, 43, 226)",
+  "brown": "rgb(165, 42, 42)",
+  "brown1": "rgb(255, 64, 64)",
+  "brown2": "rgb(238, 59, 59)",
+  "brown3": "rgb(205, 51, 51)",
+  "brown4": "rgb(139, 35, 35)",
+  "burlywood": "rgb(222, 184, 135)",
+  "burlywood1": "rgb(255, 211, 155)",
+  "burlywood2": "rgb(238, 197, 145)",
+  "burlywood3": "rgb(205, 170, 125)",
+  "burlywood4": "rgb(139, 115, 85)",
+  "cadetblue": "rgb(95, 158, 160)",
+  "cadetblue1": "rgb(152, 245, 255)",
+  "cadetblue2": "rgb(142, 229, 238)",
+  "cadetblue3": "rgb(122, 197, 205)",
+  "cadetblue4": "rgb(83, 134, 139)",
+  "chartreuse": "rgb(127, 255, 0)",
+  "chartreuse1": "rgb(127, 255, 0)",
+  "chartreuse2": "rgb(118, 238, 0)",
+  "chartreuse3": "rgb(102, 205, 0)",
+  "chartreuse4": "rgb(69, 139, 0)",
+  "chocolate": "rgb(210, 105, 30)",
+  "chocolate1": "rgb(255, 127, 36)",
+  "chocolate2": "rgb(238, 118, 33)",
+  "chocolate3": "rgb(205, 102, 29)",
+  "chocolate4": "rgb(139, 69, 19)",
+  "coral": "rgb(255, 127, 80)",
+  "coral1": "rgb(255, 114, 86)",
+  "coral2": "rgb(238, 106, 80)",
+  "coral3": "rgb(205, 91, 69)",
+  "coral4": "rgb(139, 62, 47)",
+  "cornflowerblue": "rgb(100, 149, 237)",
+  "cornsilk": "rgb(255, 248, 220)",
+  "cornsilk1": "rgb(255, 248, 220)",
+  "cornsilk2": "rgb(238, 232, 205)",
+  "cornsilk3": "rgb(205, 200, 177)",
+  "cornsilk4": "rgb(139, 136, 120)",
+  "cyan": "rgb(0, 255, 255)",
+  "cyan1": "rgb(0, 255, 255)",
+  "cyan2": "rgb(0, 238, 238)",
+  "cyan3": "rgb(0, 205, 205)",
+  "cyan4": "rgb(0, 139, 139)",
+  "darkblue": "rgb(0, 0, 139)",
+  "darkcyan": "rgb(0, 139, 139)",
+  "darkgoldenrod": "rgb(184, 134, 11)",
+  "darkgoldenrod1": "rgb(255, 185, 15)",
+  "darkgoldenrod2": "rgb(238, 173, 14)",
+  "darkgoldenrod3": "rgb(205, 149, 12)",
+  "darkgoldenrod4": "rgb(139, 101, 8)",
+  "darkgray": "rgb(169, 169, 169)",
+  "darkgreen": "rgb(0, 100, 0)",
+  "darkgrey": "rgb(169, 169, 169)",
+  "darkkhaki": "rgb(189, 183, 107)",
+  "darkmagenta": "rgb(139, 0, 139)",
+  "darkolivegreen": "rgb(85, 107, 47)",
+  "darkolivegreen1": "rgb(202, 255, 112)",
+  "darkolivegreen2": "rgb(188, 238, 104)",
+  "darkolivegreen3": "rgb(162, 205, 90)",
+  "darkolivegreen4": "rgb(110, 139, 61)",
+  "darkorange": "rgb(255, 140, 0)",
+  "darkorange1": "rgb(255, 127, 0)",
+  "darkorange2": "rgb(238, 118, 0)",
+  "darkorange3": "rgb(205, 102, 0)",
+  "darkorange4": "rgb(139, 69, 0)",
+  "darkorchid": "rgb(153, 50, 204)",
+  "darkorchid1": "rgb(191, 62, 255)",
+  "darkorchid2": "rgb(178, 58, 238)",
+  "darkorchid3": "rgb(154, 50, 205)",
+  "darkorchid4": "rgb(104, 34, 139)",
+  "darkred": "rgb(139, 0, 0)",
+  "darksalmon": "rgb(233, 150, 122)",
+  "darkseagreen": "rgb(143, 188, 143)",
+  "darkseagreen1": "rgb(193, 255, 193)",
+  "darkseagreen2": "rgb(180, 238, 180)",
+  "darkseagreen3": "rgb(155, 205, 155)",
+  "darkseagreen4": "rgb(105, 139, 105)",
+  "darkslateblue": "rgb(72, 61, 139)",
+  "darkslategray": "rgb(47, 79, 79)",
+  "darkslategray1": "rgb(151, 255, 255)",
+  "darkslategray2": "rgb(141, 238, 238)",
+  "darkslategray3": "rgb(121, 205, 205)",
+  "darkslategray4": "rgb(82, 139, 139)",
+  "darkslategrey": "rgb(47, 79, 79)",
+  "darkturquoise": "rgb(0, 206, 209)",
+  "darkviolet": "rgb(148, 0, 211)",
+  "debianred": "rgb(215, 7, 81)",
+  "deeppink": "rgb(255, 20, 147)",
+  "deeppink1": "rgb(255, 20, 147)",
+  "deeppink2": "rgb(238, 18, 137)",
+  "deeppink3": "rgb(205, 16, 118)",
+  "deeppink4": "rgb(139, 10, 80)",
+  "deepskyblue": "rgb(0, 191, 255)",
+  "deepskyblue1": "rgb(0, 191, 255)",
+  "deepskyblue2": "rgb(0, 178, 238)",
+  "deepskyblue3": "rgb(0, 154, 205)",
+  "deepskyblue4": "rgb(0, 104, 139)",
+  "dimgray": "rgb(105, 105, 105)",
+  "dimgrey": "rgb(105, 105, 105)",
+  "dodgerblue": "rgb(30, 144, 255)",
+  "dodgerblue1": "rgb(30, 144, 255)",
+  "dodgerblue2": "rgb(28, 134, 238)",
+  "dodgerblue3": "rgb(24, 116, 205)",
+  "dodgerblue4": "rgb(16, 78, 139)",
+  "firebrick": "rgb(178, 34, 34)",
+  "firebrick1": "rgb(255, 48, 48)",
+  "firebrick2": "rgb(238, 44, 44)",
+  "firebrick3": "rgb(205, 38, 38)",
+  "firebrick4": "rgb(139, 26, 26)",
+  "floralwhite": "rgb(255, 250, 240)",
+  "forestgreen": "rgb(34, 139, 34)",
+  "gainsboro": "rgb(220, 220, 220)",
+  "ghostwhite": "rgb(248, 248, 255)",
+  "gold": "rgb(255, 215, 0)",
+  "gold1": "rgb(255, 215, 0)",
+  "gold2": "rgb(238, 201, 0)",
+  "gold3": "rgb(205, 173, 0)",
+  "gold4": "rgb(139, 117, 0)",
+  "goldenrod": "rgb(218, 165, 32)",
+  "goldenrod1": "rgb(255, 193, 37)",
+  "goldenrod2": "rgb(238, 180, 34)",
+  "goldenrod3": "rgb(205, 155, 29)",
+  "goldenrod4": "rgb(139, 105, 20)",
+  "gray": "rgb(190, 190, 190)",
+  "gray0": "rgb(0, 0, 0)",
+  "gray1": "rgb(3, 3, 3)",
+  "gray10": "rgb(26, 26, 26)",
+  "gray100": "rgb(255, 255, 255)",
+  "gray11": "rgb(28, 28, 28)",
+  "gray12": "rgb(31, 31, 31)",
+  "gray13": "rgb(33, 33, 33)",
+  "gray14": "rgb(36, 36, 36)",
+  "gray15": "rgb(38, 38, 38)",
+  "gray16": "rgb(41, 41, 41)",
+  "gray17": "rgb(43, 43, 43)",
+  "gray18": "rgb(46, 46, 46)",
+  "gray19": "rgb(48, 48, 48)",
+  "gray2": "rgb(5, 5, 5)",
+  "gray20": "rgb(51, 51, 51)",
+  "gray21": "rgb(54, 54, 54)",
+  "gray22": "rgb(56, 56, 56)",
+  "gray23": "rgb(59, 59, 59)",
+  "gray24": "rgb(61, 61, 61)",
+  "gray25": "rgb(64, 64, 64)",
+  "gray26": "rgb(66, 66, 66)",
+  "gray27": "rgb(69, 69, 69)",
+  "gray28": "rgb(71, 71, 71)",
+  "gray29": "rgb(74, 74, 74)",
+  "gray3": "rgb(8, 8, 8)",
+  "gray30": "rgb(77, 77, 77)",
+  "gray31": "rgb(79, 79, 79)",
+  "gray32": "rgb(82, 82, 82)",
+  "gray33": "rgb(84, 84, 84)",
+  "gray34": "rgb(87, 87, 87)",
+  "gray35": "rgb(89, 89, 89)",
+  "gray36": "rgb(92, 92, 92)",
+  "gray37": "rgb(94, 94, 94)",
+  "gray38": "rgb(97, 97, 97)",
+  "gray39": "rgb(99, 99, 99)",
+  "gray4": "rgb(10, 10, 10)",
+  "gray40": "rgb(102, 102, 102)",
+  "gray41": "rgb(105, 105, 105)",
+  "gray42": "rgb(107, 107, 107)",
+  "gray43": "rgb(110, 110, 110)",
+  "gray44": "rgb(112, 112, 112)",
+  "gray45": "rgb(115, 115, 115)",
+  "gray46": "rgb(117, 117, 117)",
+  "gray47": "rgb(120, 120, 120)",
+  "gray48": "rgb(122, 122, 122)",
+  "gray49": "rgb(125, 125, 125)",
+  "gray5": "rgb(13, 13, 13)",
+  "gray50": "rgb(127, 127, 127)",
+  "gray51": "rgb(130, 130, 130)",
+  "gray52": "rgb(133, 133, 133)",
+  "gray53": "rgb(135, 135, 135)",
+  "gray54": "rgb(138, 138, 138)",
+  "gray55": "rgb(140, 140, 140)",
+  "gray56": "rgb(143, 143, 143)",
+  "gray57": "rgb(145, 145, 145)",
+  "gray58": "rgb(148, 148, 148)",
+  "gray59": "rgb(150, 150, 150)",
+  "gray6": "rgb(15, 15, 15)",
+  "gray60": "rgb(153, 153, 153)",
+  "gray61": "rgb(156, 156, 156)",
+  "gray62": "rgb(158, 158, 158)",
+  "gray63": "rgb(161, 161, 161)",
+  "gray64": "rgb(163, 163, 163)",
+  "gray65": "rgb(166, 166, 166)",
+  "gray66": "rgb(168, 168, 168)",
+  "gray67": "rgb(171, 171, 171)",
+  "gray68": "rgb(173, 173, 173)",
+  "gray69": "rgb(176, 176, 176)",
+  "gray7": "rgb(18, 18, 18)",
+  "gray70": "rgb(179, 179, 179)",
+  "gray71": "rgb(181, 181, 181)",
+  "gray72": "rgb(184, 184, 184)",
+  "gray73": "rgb(186, 186, 186)",
+  "gray74": "rgb(189, 189, 189)",
+  "gray75": "rgb(191, 191, 191)",
+  "gray76": "rgb(194, 194, 194)",
+  "gray77": "rgb(196, 196, 196)",
+  "gray78": "rgb(199, 199, 199)",
+  "gray79": "rgb(201, 201, 201)",
+  "gray8": "rgb(20, 20, 20)",
+  "gray80": "rgb(204, 204, 204)",
+  "gray81": "rgb(207, 207, 207)",
+  "gray82": "rgb(209, 209, 209)",
+  "gray83": "rgb(212, 212, 212)",
+  "gray84": "rgb(214, 214, 214)",
+  "gray85": "rgb(217, 217, 217)",
+  "gray86": "rgb(219, 219, 219)",
+  "gray87": "rgb(222, 222, 222)",
+  "gray88": "rgb(224, 224, 224)",
+  "gray89": "rgb(227, 227, 227)",
+  "gray9": "rgb(23, 23, 23)",
+  "gray90": "rgb(229, 229, 229)",
+  "gray91": "rgb(232, 232, 232)",
+  "gray92": "rgb(235, 235, 235)",
+  "gray93": "rgb(237, 237, 237)",
+  "gray94": "rgb(240, 240, 240)",
+  "gray95": "rgb(242, 242, 242)",
+  "gray96": "rgb(245, 245, 245)",
+  "gray97": "rgb(247, 247, 247)",
+  "gray98": "rgb(250, 250, 250)",
+  "gray99": "rgb(252, 252, 252)",
+  "green": "rgb(0, 255, 0)",
+  "green1": "rgb(0, 255, 0)",
+  "green2": "rgb(0, 238, 0)",
+  "green3": "rgb(0, 205, 0)",
+  "green4": "rgb(0, 139, 0)",
+  "greenyellow": "rgb(173, 255, 47)",
+  "grey": "rgb(190, 190, 190)",
+  "grey0": "rgb(0, 0, 0)",
+  "grey1": "rgb(3, 3, 3)",
+  "grey10": "rgb(26, 26, 26)",
+  "grey100": "rgb(255, 255, 255)",
+  "grey11": "rgb(28, 28, 28)",
+  "grey12": "rgb(31, 31, 31)",
+  "grey13": "rgb(33, 33, 33)",
+  "grey14": "rgb(36, 36, 36)",
+  "grey15": "rgb(38, 38, 38)",
+  "grey16": "rgb(41, 41, 41)",
+  "grey17": "rgb(43, 43, 43)",
+  "grey18": "rgb(46, 46, 46)",
+  "grey19": "rgb(48, 48, 48)",
+  "grey2": "rgb(5, 5, 5)",
+  "grey20": "rgb(51, 51, 51)",
+  "grey21": "rgb(54, 54, 54)",
+  "grey22": "rgb(56, 56, 56)",
+  "grey23": "rgb(59, 59, 59)",
+  "grey24": "rgb(61, 61, 61)",
+  "grey25": "rgb(64, 64, 64)",
+  "grey26": "rgb(66, 66, 66)",
+  "grey27": "rgb(69, 69, 69)",
+  "grey28": "rgb(71, 71, 71)",
+  "grey29": "rgb(74, 74, 74)",
+  "grey3": "rgb(8, 8, 8)",
+  "grey30": "rgb(77, 77, 77)",
+  "grey31": "rgb(79, 79, 79)",
+  "grey32": "rgb(82, 82, 82)",
+  "grey33": "rgb(84, 84, 84)",
+  "grey34": "rgb(87, 87, 87)",
+  "grey35": "rgb(89, 89, 89)",
+  "grey36": "rgb(92, 92, 92)",
+  "grey37": "rgb(94, 94, 94)",
+  "grey38": "rgb(97, 97, 97)",
+  "grey39": "rgb(99, 99, 99)",
+  "grey4": "rgb(10, 10, 10)",
+  "grey40": "rgb(102, 102, 102)",
+  "grey41": "rgb(105, 105, 105)",
+  "grey42": "rgb(107, 107, 107)",
+  "grey43": "rgb(110, 110, 110)",
+  "grey44": "rgb(112, 112, 112)",
+  "grey45": "rgb(115, 115, 115)",
+  "grey46": "rgb(117, 117, 117)",
+  "grey47": "rgb(120, 120, 120)",
+  "grey48": "rgb(122, 122, 122)",
+  "grey49": "rgb(125, 125, 125)",
+  "grey5": "rgb(13, 13, 13)",
+  "grey50": "rgb(127, 127, 127)",
+  "grey51": "rgb(130, 130, 130)",
+  "grey52": "rgb(133, 133, 133)",
+  "grey53": "rgb(135, 135, 135)",
+  "grey54": "rgb(138, 138, 138)",
+  "grey55": "rgb(140, 140, 140)",
+  "grey56": "rgb(143, 143, 143)",
+  "grey57": "rgb(145, 145, 145)",
+  "grey58": "rgb(148, 148, 148)",
+  "grey59": "rgb(150, 150, 150)",
+  "grey6": "rgb(15, 15, 15)",
+  "grey60": "rgb(153, 153, 153)",
+  "grey61": "rgb(156, 156, 156)",
+  "grey62": "rgb(158, 158, 158)",
+  "grey63": "rgb(161, 161, 161)",
+  "grey64": "rgb(163, 163, 163)",
+  "grey65": "rgb(166, 166, 166)",
+  "grey66": "rgb(168, 168, 168)",
+  "grey67": "rgb(171, 171, 171)",
+  "grey68": "rgb(173, 173, 173)",
+  "grey69": "rgb(176, 176, 176)",
+  "grey7": "rgb(18, 18, 18)",
+  "grey70": "rgb(179, 179, 179)",
+  "grey71": "rgb(181, 181, 181)",
+  "grey72": "rgb(184, 184, 184)",
+  "grey73": "rgb(186, 186, 186)",
+  "grey74": "rgb(189, 189, 189)",
+  "grey75": "rgb(191, 191, 191)",
+  "grey76": "rgb(194, 194, 194)",
+  "grey77": "rgb(196, 196, 196)",
+  "grey78": "rgb(199, 199, 199)",
+  "grey79": "rgb(201, 201, 201)",
+  "grey8": "rgb(20, 20, 20)",
+  "grey80": "rgb(204, 204, 204)",
+  "grey81": "rgb(207, 207, 207)",
+  "grey82": "rgb(209, 209, 209)",
+  "grey83": "rgb(212, 212, 212)",
+  "grey84": "rgb(214, 214, 214)",
+  "grey85": "rgb(217, 217, 217)",
+  "grey86": "rgb(219, 219, 219)",
+  "grey87": "rgb(222, 222, 222)",
+  "grey88": "rgb(224, 224, 224)",
+  "grey89": "rgb(227, 227, 227)",
+  "grey9": "rgb(23, 23, 23)",
+  "grey90": "rgb(229, 229, 229)",
+  "grey91": "rgb(232, 232, 232)",
+  "grey92": "rgb(235, 235, 235)",
+  "grey93": "rgb(237, 237, 237)",
+  "grey94": "rgb(240, 240, 240)",
+  "grey95": "rgb(242, 242, 242)",
+  "grey96": "rgb(245, 245, 245)",
+  "grey97": "rgb(247, 247, 247)",
+  "grey98": "rgb(250, 250, 250)",
+  "grey99": "rgb(252, 252, 252)",
+  "honeydew": "rgb(240, 255, 240)",
+  "honeydew1": "rgb(240, 255, 240)",
+  "honeydew2": "rgb(224, 238, 224)",
+  "honeydew3": "rgb(193, 205, 193)",
+  "honeydew4": "rgb(131, 139, 131)",
+  "hotpink": "rgb(255, 105, 180)",
+  "hotpink1": "rgb(255, 110, 180)",
+  "hotpink2": "rgb(238, 106, 167)",
+  "hotpink3": "rgb(205, 96, 144)",
+  "hotpink4": "rgb(139, 58, 98)",
+  "indianred": "rgb(205, 92, 92)",
+  "indianred1": "rgb(255, 106, 106)",
+  "indianred2": "rgb(238, 99, 99)",
+  "indianred3": "rgb(205, 85, 85)",
+  "indianred4": "rgb(139, 58, 58)",
+  "ivory": "rgb(255, 255, 240)",
+  "ivory1": "rgb(255, 255, 240)",
+  "ivory2": "rgb(238, 238, 224)",
+  "ivory3": "rgb(205, 205, 193)",
+  "ivory4": "rgb(139, 139, 131)",
+  "khaki": "rgb(240, 230, 140)",
+  "khaki1": "rgb(255, 246, 143)",
+  "khaki2": "rgb(238, 230, 133)",
+  "khaki3": "rgb(205, 198, 115)",
+  "khaki4": "rgb(139, 134, 78)",
+  "lavender": "rgb(230, 230, 250)",
+  "lavenderblush": "rgb(255, 240, 245)",
+  "lavenderblush1": "rgb(255, 240, 245)",
+  "lavenderblush2": "rgb(238, 224, 229)",
+  "lavenderblush3": "rgb(205, 193, 197)",
+  "lavenderblush4": "rgb(139, 131, 134)",
+  "lawngreen": "rgb(124, 252, 0)",
+  "lemonchiffon": "rgb(255, 250, 205)",
+  "lemonchiffon1": "rgb(255, 250, 205)",
+  "lemonchiffon2": "rgb(238, 233, 191)",
+  "lemonchiffon3": "rgb(205, 201, 165)",
+  "lemonchiffon4": "rgb(139, 137, 112)",
+  "lightblue": "rgb(173, 216, 230)",
+  "lightblue1": "rgb(191, 239, 255)",
+  "lightblue2": "rgb(178, 223, 238)",
+  "lightblue3": "rgb(154, 192, 205)",
+  "lightblue4": "rgb(104, 131, 139)",
+  "lightcoral": "rgb(240, 128, 128)",
+  "lightcyan": "rgb(224, 255, 255)",
+  "lightcyan1": "rgb(224, 255, 255)",
+  "lightcyan2": "rgb(209, 238, 238)",
+  "lightcyan3": "rgb(180, 205, 205)",
+  "lightcyan4": "rgb(122, 139, 139)",
+  "lightgoldenrod": "rgb(238, 221, 130)",
+  "lightgoldenrod1": "rgb(255, 236, 139)",
+  "lightgoldenrod2": "rgb(238, 220, 130)",
+  "lightgoldenrod3": "rgb(205, 190, 112)",
+  "lightgoldenrod4": "rgb(139, 129, 76)",
+  "lightgoldenrodyellow": "rgb(250, 250, 210)",
+  "lightgray": "rgb(211, 211, 211)",
+  "lightgreen": "rgb(144, 238, 144)",
+  "lightgrey": "rgb(211, 211, 211)",
+  "lightpink": "rgb(255, 182, 193)",
+  "lightpink1": "rgb(255, 174, 185)",
+  "lightpink2": "rgb(238, 162, 173)",
+  "lightpink3": "rgb(205, 140, 149)",
+  "lightpink4": "rgb(139, 95, 101)",
+  "lightsalmon": "rgb(255, 160, 122)",
+  "lightsalmon1": "rgb(255, 160, 122)",
+  "lightsalmon2": "rgb(238, 149, 114)",
+  "lightsalmon3": "rgb(205, 129, 98)",
+  "lightsalmon4": "rgb(139, 87, 66)",
+  "lightseagreen": "rgb(32, 178, 170)",
+  "lightskyblue": "rgb(135, 206, 250)",
+  "lightskyblue1": "rgb(176, 226, 255)",
+  "lightskyblue2": "rgb(164, 211, 238)",
+  "lightskyblue3": "rgb(141, 182, 205)",
+  "lightskyblue4": "rgb(96, 123, 139)",
+  "lightslateblue": "rgb(132, 112, 255)",
+  "lightslategray": "rgb(119, 136, 153)",
+  "lightslategrey": "rgb(119, 136, 153)",
+  "lightsteelblue": "rgb(176, 196, 222)",
+  "lightsteelblue1": "rgb(202, 225, 255)",
+  "lightsteelblue2": "rgb(188, 210, 238)",
+  "lightsteelblue3": "rgb(162, 181, 205)",
+  "lightsteelblue4": "rgb(110, 123, 139)",
+  "lightyellow": "rgb(255, 255, 224)",
+  "lightyellow1": "rgb(255, 255, 224)",
+  "lightyellow2": "rgb(238, 238, 209)",
+  "lightyellow3": "rgb(205, 205, 180)",
+  "lightyellow4": "rgb(139, 139, 122)",
+  "limegreen": "rgb(50, 205, 50)",
+  "linen": "rgb(250, 240, 230)",
+  "magenta": "rgb(255, 0, 255)",
+  "magenta1": "rgb(255, 0, 255)",
+  "magenta2": "rgb(238, 0, 238)",
+  "magenta3": "rgb(205, 0, 205)",
+  "magenta4": "rgb(139, 0, 139)",
+  "maroon": "rgb(176, 48, 96)",
+  "maroon1": "rgb(255, 52, 179)",
+  "maroon2": "rgb(238, 48, 167)",
+  "maroon3": "rgb(205, 41, 144)",
+  "maroon4": "rgb(139, 28, 98)",
+  "mediumaquamarine": "rgb(102, 205, 170)",
+  "mediumblue": "rgb(0, 0, 205)",
+  "mediumorchid": "rgb(186, 85, 211)",
+  "mediumorchid1": "rgb(224, 102, 255)",
+  "mediumorchid2": "rgb(209, 95, 238)",
+  "mediumorchid3": "rgb(180, 82, 205)",
+  "mediumorchid4": "rgb(122, 55, 139)",
+  "mediumpurple": "rgb(147, 112, 219)",
+  "mediumpurple1": "rgb(171, 130, 255)",
+  "mediumpurple2": "rgb(159, 121, 238)",
+  "mediumpurple3": "rgb(137, 104, 205)",
+  "mediumpurple4": "rgb(93, 71, 139)",
+  "mediumseagreen": "rgb(60, 179, 113)",
+  "mediumslateblue": "rgb(123, 104, 238)",
+  "mediumspringgreen": "rgb(0, 250, 154)",
+  "mediumturquoise": "rgb(72, 209, 204)",
+  "mediumvioletred": "rgb(199, 21, 133)",
+  "midnightblue": "rgb(25, 25, 112)",
+  "mintcream": "rgb(245, 255, 250)",
+  "mistyrose": "rgb(255, 228, 225)",
+  "mistyrose1": "rgb(255, 228, 225)",
+  "mistyrose2": "rgb(238, 213, 210)",
+  "mistyrose3": "rgb(205, 183, 181)",
+  "mistyrose4": "rgb(139, 125, 123)",
+  "moccasin": "rgb(255, 228, 181)",
+  "navajowhite": "rgb(255, 222, 173)",
+  "navajowhite1": "rgb(255, 222, 173)",
+  "navajowhite2": "rgb(238, 207, 161)",
+  "navajowhite3": "rgb(205, 179, 139)",
+  "navajowhite4": "rgb(139, 121, 94)",
+  "navy": "rgb(0, 0, 128)",
+  "navyblue": "rgb(0, 0, 128)",
+  "oldlace": "rgb(253, 245, 230)",
+  "olivedrab": "rgb(107, 142, 35)",
+  "olivedrab1": "rgb(192, 255, 62)",
+  "olivedrab2": "rgb(179, 238, 58)",
+  "olivedrab3": "rgb(154, 205, 50)",
+  "olivedrab4": "rgb(105, 139, 34)",
+  "orange": "rgb(255, 165, 0)",
+  "orange1": "rgb(255, 165, 0)",
+  "orange2": "rgb(238, 154, 0)",
+  "orange3": "rgb(205, 133, 0)",
+  "orange4": "rgb(139, 90, 0)",
+  "orangered": "rgb(255, 69, 0)",
+  "orangered1": "rgb(255, 69, 0)",
+  "orangered2": "rgb(238, 64, 0)",
+  "orangered3": "rgb(205, 55, 0)",
+  "orangered4": "rgb(139, 37, 0)",
+  "orchid": "rgb(218, 112, 214)",
+  "orchid1": "rgb(255, 131, 250)",
+  "orchid2": "rgb(238, 122, 233)",
+  "orchid3": "rgb(205, 105, 201)",
+  "orchid4": "rgb(139, 71, 137)",
+  "palegoldenrod": "rgb(238, 232, 170)",
+  "palegreen": "rgb(152, 251, 152)",
+  "palegreen1": "rgb(154, 255, 154)",
+  "palegreen2": "rgb(144, 238, 144)",
+  "palegreen3": "rgb(124, 205, 124)",
+  "palegreen4": "rgb(84, 139, 84)",
+  "paleturquoise": "rgb(175, 238, 238)",
+  "paleturquoise1": "rgb(187, 255, 255)",
+  "paleturquoise2": "rgb(174, 238, 238)",
+  "paleturquoise3": "rgb(150, 205, 205)",
+  "paleturquoise4": "rgb(102, 139, 139)",
+  "palevioletred": "rgb(219, 112, 147)",
+  "palevioletred1": "rgb(255, 130, 171)",
+  "palevioletred2": "rgb(238, 121, 159)",
+  "palevioletred3": "rgb(205, 104, 137)",
+  "palevioletred4": "rgb(139, 71, 93)",
+  "papayawhip": "rgb(255, 239, 213)",
+  "peachpuff": "rgb(255, 218, 185)",
+  "peachpuff1": "rgb(255, 218, 185)",
+  "peachpuff2": "rgb(238, 203, 173)",
+  "peachpuff3": "rgb(205, 175, 149)",
+  "peachpuff4": "rgb(139, 119, 101)",
+  "peru": "rgb(205, 133, 63)",
+  "pink": "rgb(255, 192, 203)",
+  "pink1": "rgb(255, 181, 197)",
+  "pink2": "rgb(238, 169, 184)",
+  "pink3": "rgb(205, 145, 158)",
+  "pink4": "rgb(139, 99, 108)",
+  "plum": "rgb(221, 160, 221)",
+  "plum1": "rgb(255, 187, 255)",
+  "plum2": "rgb(238, 174, 238)",
+  "plum3": "rgb(205, 150, 205)",
+  "plum4": "rgb(139, 102, 139)",
+  "powderblue": "rgb(176, 224, 230)",
+  "purple": "rgb(160, 32, 240)",
+  "purple1": "rgb(155, 48, 255)",
+  "purple2": "rgb(145, 44, 238)",
+  "purple3": "rgb(125, 38, 205)",
+  "purple4": "rgb(85, 26, 139)",
+  "red": "rgb(255, 0, 0)",
+  "red1": "rgb(255, 0, 0)",
+  "red2": "rgb(238, 0, 0)",
+  "red3": "rgb(205, 0, 0)",
+  "red4": "rgb(139, 0, 0)",
+  "rosybrown": "rgb(188, 143, 143)",
+  "rosybrown1": "rgb(255, 193, 193)",
+  "rosybrown2": "rgb(238, 180, 180)",
+  "rosybrown3": "rgb(205, 155, 155)",
+  "rosybrown4": "rgb(139, 105, 105)",
+  "royalblue": "rgb(65, 105, 225)",
+  "royalblue1": "rgb(72, 118, 255)",
+  "royalblue2": "rgb(67, 110, 238)",
+  "royalblue3": "rgb(58, 95, 205)",
+  "royalblue4": "rgb(39, 64, 139)",
+  "saddlebrown": "rgb(139, 69, 19)",
+  "salmon": "rgb(250, 128, 114)",
+  "salmon1": "rgb(255, 140, 105)",
+  "salmon2": "rgb(238, 130, 98)",
+  "salmon3": "rgb(205, 112, 84)",
+  "salmon4": "rgb(139, 76, 57)",
+  "sandybrown": "rgb(244, 164, 96)",
+  "seagreen": "rgb(46, 139, 87)",
+  "seagreen1": "rgb(84, 255, 159)",
+  "seagreen2": "rgb(78, 238, 148)",
+  "seagreen3": "rgb(67, 205, 128)",
+  "seagreen4": "rgb(46, 139, 87)",
+  "seashell": "rgb(255, 245, 238)",
+  "seashell1": "rgb(255, 245, 238)",
+  "seashell2": "rgb(238, 229, 222)",
+  "seashell3": "rgb(205, 197, 191)",
+  "seashell4": "rgb(139, 134, 130)",
+  "sienna": "rgb(160, 82, 45)",
+  "sienna1": "rgb(255, 130, 71)",
+  "sienna2": "rgb(238, 121, 66)",
+  "sienna3": "rgb(205, 104, 57)",
+  "sienna4": "rgb(139, 71, 38)",
+  "skyblue": "rgb(135, 206, 235)",
+  "skyblue1": "rgb(135, 206, 255)",
+  "skyblue2": "rgb(126, 192, 238)",
+  "skyblue3": "rgb(108, 166, 205)",
+  "skyblue4": "rgb(74, 112, 139)",
+  "slateblue": "rgb(106, 90, 205)",
+  "slateblue1": "rgb(131, 111, 255)",
+  "slateblue2": "rgb(122, 103, 238)",
+  "slateblue3": "rgb(105, 89, 205)",
+  "slateblue4": "rgb(71, 60, 139)",
+  "slategray": "rgb(112, 128, 144)",
+  "slategray1": "rgb(198, 226, 255)",
+  "slategray2": "rgb(185, 211, 238)",
+  "slategray3": "rgb(159, 182, 205)",
+  "slategray4": "rgb(108, 123, 139)",
+  "slategrey": "rgb(112, 128, 144)",
+  "snow": "rgb(255, 250, 250)",
+  "snow1": "rgb(255, 250, 250)",
+  "snow2": "rgb(238, 233, 233)",
+  "snow3": "rgb(205, 201, 201)",
+  "snow4": "rgb(139, 137, 137)",
+  "springgreen": "rgb(0, 255, 127)",
+  "springgreen1": "rgb(0, 255, 127)",
+  "springgreen2": "rgb(0, 238, 118)",
+  "springgreen3": "rgb(0, 205, 102)",
+  "springgreen4": "rgb(0, 139, 69)",
+  "steelblue": "rgb(70, 130, 180)",
+  "steelblue1": "rgb(99, 184, 255)",
+  "steelblue2": "rgb(92, 172, 238)",
+  "steelblue3": "rgb(79, 148, 205)",
+  "steelblue4": "rgb(54, 100, 139)",
+  "tan": "rgb(210, 180, 140)",
+  "tan1": "rgb(255, 165, 79)",
+  "tan2": "rgb(238, 154, 73)",
+  "tan3": "rgb(205, 133, 63)",
+  "tan4": "rgb(139, 90, 43)",
+  "thistle": "rgb(216, 191, 216)",
+  "thistle1": "rgb(255, 225, 255)",
+  "thistle2": "rgb(238, 210, 238)",
+  "thistle3": "rgb(205, 181, 205)",
+  "thistle4": "rgb(139, 123, 139)",
+  "tomato": "rgb(255, 99, 71)",
+  "tomato1": "rgb(255, 99, 71)",
+  "tomato2": "rgb(238, 92, 66)",
+  "tomato3": "rgb(205, 79, 57)",
+  "tomato4": "rgb(139, 54, 38)",
+  "turquoise": "rgb(64, 224, 208)",
+  "turquoise1": "rgb(0, 245, 255)",
+  "turquoise2": "rgb(0, 229, 238)",
+  "turquoise3": "rgb(0, 197, 205)",
+  "turquoise4": "rgb(0, 134, 139)",
+  "violet": "rgb(238, 130, 238)",
+  "violetred": "rgb(208, 32, 144)",
+  "violetred1": "rgb(255, 62, 150)",
+  "violetred2": "rgb(238, 58, 140)",
+  "violetred3": "rgb(205, 50, 120)",
+  "violetred4": "rgb(139, 34, 82)",
+  "wheat": "rgb(245, 222, 179)",
+  "wheat1": "rgb(255, 231, 186)",
+  "wheat2": "rgb(238, 216, 174)",
+  "wheat3": "rgb(205, 186, 150)",
+  "wheat4": "rgb(139, 126, 102)",
+  "white": "rgb(255, 255, 255)",
+  "whitesmoke": "rgb(245, 245, 245)",
+  "yellow": "rgb(255, 255, 0)",
+  "yellow1": "rgb(255, 255, 0)",
+  "yellow2": "rgb(238, 238, 0)",
+  "yellow3": "rgb(205, 205, 0)",
+  "yellow4": "rgb(139, 139, 0)",
+  "yellowgreen": "rgb(154, 205, 50)"
+};
+// SOURCE FILE: libdot/js/lib_f.js
+// Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+'use strict';
+
+/**
+ * Grab bag of utility functions.
+ */
+lib.f = {};
+
+/**
+ * Replace variable references in a string.
+ *
+ * Variables are of the form %FUNCTION(VARNAME).  FUNCTION is an optional
+ * escape function to apply to the value.
+ *
+ * For example
+ *   lib.f.replaceVars("%(greeting), %encodeURIComponent(name)",
+ *                     { greeting: "Hello",
+ *                       name: "Google+" });
+ *
+ * Will result in "Hello, Google%2B".
+ */
+lib.f.replaceVars = function(str, vars) {
+  return str.replace(/%([a-z]*)\(([^\)]+)\)/gi, function(match, fn, varname) {
+      if (typeof vars[varname] == 'undefined')
+        throw 'Unknown variable: ' + varname;
+
+      var rv = vars[varname];
+
+      if (fn in lib.f.replaceVars.functions) {
+        rv = lib.f.replaceVars.functions[fn](rv);
+      } else if (fn) {
+        throw 'Unknown escape function: ' + fn;
+      }
+
+      return rv;
+    });
+};
+
+/**
+ * Functions that can be used with replaceVars.
+ *
+ * Clients can add to this list to extend lib.f.replaceVars().
+ */
+lib.f.replaceVars.functions = {
+  encodeURI: encodeURI,
+  encodeURIComponent: encodeURIComponent,
+  escapeHTML: function(str) {
+    var map = {
+      '<': '&lt;',
+      '>': '&gt;',
+      '&': '&amp;',
+      '"': '&quot;',
+      "'": '&#39;'
+    };
+
+    return str.replace(/[<>&\"\']/g, function(m) { return map[m] });
+  }
+};
+
+/**
+ * Get the list of accepted UI languages.
+ *
+ * @param {function(Array)} callback Function to invoke with the results.  The
+ *     parameter is a list of locale names.
+ */
+lib.f.getAcceptLanguages = function(callback) {
+  if (window.chrome && chrome.i18n) {
+    chrome.i18n.getAcceptLanguages(callback);
+  } else {
+    setTimeout(function() {
+        callback([navigator.language.replace(/-/g, '_')]);
+      }, 0);
+  }
+};
+
+/**
+ * Parse a query string into a hash.
+ *
+ * This takes a url query string in the form 'name1=value&name2=value' and
+ * converts it into an object of the form { name1: 'value', name2: 'value' }.
+ * If a given name appears multiple times in the query string, only the
+ * last value will appear in the result.
+ *
+ * Names and values are passed through decodeURIComponent before being added
+ * to the result object.
+ *
+ * @param {string} queryString The string to parse.  If it starts with a
+ *     leading '?', the '?' will be ignored.
+ */
+lib.f.parseQuery = function(queryString) {
+  if (queryString.substr(0, 1) == '?')
+    queryString = queryString.substr(1);
+
+  var rv = {};
+
+  var pairs = queryString.split('&');
+  for (var i = 0; i < pairs.length; i++) {
+    var pair = pairs[i].split('=');
+    rv[decodeURIComponent(pair[0])] = decodeURIComponent(pair[1]);
+  }
+
+  return rv;
+};
+
+lib.f.getURL = function(path) {
+  if (window.chrome && chrome.runtime && chrome.runtime.getURL)
+    return chrome.runtime.getURL(path);
+
+  return path;
+};
+
+/**
+ * Clamp a given integer to a specified range.
+ *
+ * @param {integer} v The value to be clamped.
+ * @param {integer} min The minimum acceptable value.
+ * @param {integer} max The maximum acceptable value.
+ */
+lib.f.clamp = function(v, min, max) {
+  if (v < min)
+    return min;
+  if (v > max)
+    return max;
+  return v;
+};
+
+/**
+ * Left pad a string to a given length using a given character.
+ *
+ * @param {string} str The string to pad.
+ * @param {integer} length The desired length.
+ * @param {string} opt_ch The optional padding character, defaults to ' '.
+ * @return {string} The padded string.
+ */
+lib.f.lpad = function(str, length, opt_ch) {
+  str = String(str);
+  opt_ch = opt_ch || ' ';
+
+  while (str.length < length)
+    str = opt_ch + str;
+
+  return str;
+};
+
+/**
+ * Left pad a number to a given length with leading zeros.
+ *
+ * @param {string|integer} number The number to pad.
+ * @param {integer} length The desired length.
+ * @return {string} The padded number as a string.
+ */
+lib.f.zpad = function(number, length) {
+  return lib.f.lpad(number, length, '0');
+};
+
+/**
+ * Return a string containing a given number of space characters.
+ *
+ * This method maintains a static cache of the largest amount of whitespace
+ * ever requested.  It shouldn't be used to generate an insanely huge amount of
+ * whitespace.
+ *
+ * @param {integer} length The desired amount of whitespace.
+ * @param {string} A string of spaces of the requested length.
+ */
+lib.f.getWhitespace = function(length) {
+  if (length == 0)
+    return '';
+
+  var f = this.getWhitespace;
+  if (!f.whitespace)
+    f.whitespace = '          ';
+
+  while (length > f.whitespace.length) {
+    f.whitespace += f.whitespace;
+  }
+
+  return f.whitespace.substr(0, length);
+};
+
+ /**
+ * Ensure that a function is called within a certain time limit.
+ *
+ * Simple usage looks like this...
+ *
+ *  lib.registerInit(lib.f.alarm(onInit));
+ *
+ * This will log a warning to the console if onInit() is not invoked within
+ * 5 seconds.
+ *
+ * If you're performing some operation that may take longer than 5 seconds you
+ * can pass a duration in milliseconds as the optional second parameter.
+ *
+ * If you pass a string identifier instead of a callback function, you'll get a
+ * wrapper generator rather than a single wrapper.  Each call to the
+ * generator will return a wrapped version of the callback wired to
+ * a shared timeout.  This is for cases where you want to ensure that at least
+ * one of a set of callbacks is invoked before a timeout expires.
+ *
+ *   var alarm = lib.f.alarm('fetch object');
+ *   lib.foo.fetchObject(alarm(onSuccess), alarm(onFailure));
+ *
+ * @param {function(*)} callback The function to wrap in an alarm.
+ * @param {int} opt_ms Optional number of milliseconds to wait before raising
+ *     an alarm.  Default is 5000 (5 seconds).
+ * @return {function} If callback is a function then the return value will be
+ *     the wrapped callback.  If callback is a string then the return value will
+ *     be a function that generates new wrapped callbacks.
+ */
+lib.f.alarm = function(callback, opt_ms) {
+  var ms = opt_ms || 5 * 1000;
+  var stack = lib.f.getStack(1);
+
+  return (function() {
+    // This outer function is called immediately.  It's here to capture a new
+    // scope for the timeout variable.
+
+    // The 'timeout' variable is shared by this timeout function, and the
+    // callback wrapper.
+    var timeout = setTimeout(function() {
+      var name = (typeof callback == 'string') ? name : callback.name;
+      name = name ? (': ' + name) : '';
+      console.warn('lib.f.alarm: timeout expired: ' + (ms / 1000) + 's' + name);
+      console.log(stack);
+      timeout = null;
+    }, ms);
+
+    var wrapperGenerator = function(callback) {
+      return function() {
+        if (timeout) {
+          clearTimeout(timeout);
+          timeout = null;
+        }
+
+        return callback.apply(null, arguments);
+      }
+    };
+
+    if (typeof callback == 'string')
+      return wrapperGenerator;
+
+    return wrapperGenerator(callback);
+  })();
+};
+
+/**
+ * Return the current call stack after skipping a given number of frames.
+ *
+ * This method is intended to be used for debugging only.  It returns an
+ * Object instead of an Array, because the console stringifies arrays by
+ * default and that's not what we want.
+ *
+ * A typical call might look like...
+ *
+ *    console.log('Something wicked this way came', lib.f.getStack());
+ *    //                         Notice the comma ^
+ *
+ * This would print the message to the js console, followed by an object
+ * which can be clicked to reveal the stack.
+ *
+ * @param {number} opt_ignoreFrames The optional number of stack frames to
+ *     ignore.  The actual 'getStack' call is always ignored.
+ */
+lib.f.getStack = function(opt_ignoreFrames) {
+  var ignoreFrames = opt_ignoreFrames ? opt_ignoreFrames + 2 : 2;
+
+  var stackArray;
+
+  try {
+    throw new Error();
+  } catch (ex) {
+    stackArray = ex.stack.split('\n');
+  }
+
+  var stackObject = {};
+  for (var i = ignoreFrames; i < stackArray.length; i++) {
+    stackObject[i - ignoreFrames] = stackArray[i].replace(/^\s*at\s+/, '');
+  }
+
+  return stackObject;
+};
+
+/**
+ * Divides the two numbers and floors the results, unless the remainder is less
+ * than an incredibly small value, in which case it returns the ceiling.
+ * This is useful when the number are truncated approximations of longer
+ * values, and so doing division with these numbers yields a result incredibly
+ * close to a whole number.
+ *
+ * @param {number} numerator
+ * @param {number} denominator
+ * @return {number}
+ */
+lib.f.smartFloorDivide = function(numerator,  denominator) {
+  var val = numerator / denominator;
+  var ceiling = Math.ceil(val);
+  if (ceiling - val < .0001) {
+    return ceiling;
+  } else {
+    return Math.floor(val);
+  }
+};
+// SOURCE FILE: libdot/js/lib_message_manager.js
+// Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+'use strict';
+
+/**
+ * MessageManager class handles internationalized strings.
+ *
+ * Note: chrome.i18n isn't sufficient because...
+ *     1. There's a bug in chrome that makes it unavailable in iframes:
+ *        http://crbug.com/130200
+ *     2. The client code may not be packaged in a Chrome extension.
+ *     3. The client code may be part of a library packaged in a third-party
+ *        Chrome extension.
+ *
+ * @param {Array} languages List of languages to load, in the order they
+ *     should be loaded.  Newer messages replace older ones.  'en' is
+ *     automatically added as the first language if it is not already present.
+ */
+lib.MessageManager = function(languages) {
+  this.languages_ = languages.map(
+      function(el) { return el.replace(/-/g, '_') });
+
+  if (this.languages_.indexOf('en') == -1)
+    this.languages_.unshift('en');
+
+  this.messages = {};
+};
+
+/**
+ * Add message definitions to the message manager.
+ *
+ * This takes an object of the same format of a Chrome messages.json file.  See
+ * <http://code.google.com/chrome/extensions/i18n-messages.html>.
+ */
+lib.MessageManager.prototype.addMessages = function(defs) {
+  for (var key in defs) {
+    var def = defs[key];
+
+    if (!def.placeholders) {
+      this.messages[key] = def.message;
+    } else {
+      // Replace "$NAME$" placeholders with "$1", etc.
+      this.messages[key] = def.message.replace(
+          /\$([a-z][^\s\$]+)\$/ig,
+          function(m, name) {
+            return defs[key].placeholders[name.toLowerCase()].content;
+          });
+    }
+  }
+};
+
+/**
+ * Load the first available language message bundle.
+ *
+ * @param {string} pattern A url pattern containing a "$1" where the locale
+ *     name should go.
+ * @param {function(Array,Array)} onComplete Function to be called when loading
+ *     is complete.  The two arrays are the list of successful and failed
+ *     locale names.  If the first parameter is length 0, no locales were
+ *     loaded.
+ */
+lib.MessageManager.prototype.findAndLoadMessages = function(
+    pattern, onComplete) {
+  var languages = this.languages_.concat();
+  var loaded = [];
+  var failed = [];
+
+  function onLanguageComplete(state) {
+    if (state) {
+      loaded = languages.shift();
+    } else {
+      failed = languages.shift();
+    }
+
+    if (languages.length) {
+      tryNextLanguage();
+    } else {
+      onComplete(loaded, failed);
+    }
+  }
+
+  var tryNextLanguage = function() {
+    this.loadMessages(this.replaceReferences(pattern, languages),
+                      onLanguageComplete.bind(this, true),
+                      onLanguageComplete.bind(this, false));
+  }.bind(this);
+
+  tryNextLanguage();
+};
+
+/**
+ * Load messages from a messages.json file.
+ */
+lib.MessageManager.prototype.loadMessages = function(
+    url, onSuccess, opt_onError) {
+  var xhr = new XMLHttpRequest();
+
+  xhr.onloadend = function() {
+    if (xhr.status != 200) {
+      if (opt_onError)
+        opt_onError(xhr.status);
+
+      return;
+    }
+
+    this.addMessages(JSON.parse(xhr.responseText));
+    onSuccess();
+  }.bind(this);
+
+  xhr.open('GET', url);
+  xhr.send();
+};
+
+/**
+ * Replace $1...$n references with the elements of the args array.
+ *
+ * @param {string} msg String containing the message and argument references.
+ * @param {Array} args Array containing the argument values.
+ */
+lib.MessageManager.replaceReferences = function(msg, args) {
+  return msg.replace(/\$(\d+)/g, function (m, index) {
+      return args[index - 1];
+    });
+};
+
+/**
+ * Per-instance copy of replaceReferences.
+ */
+lib.MessageManager.prototype.replaceReferences =
+    lib.MessageManager.replaceReferences;
+
+/**
+ * Get a message by name, optionally replacing arguments too.
+ *
+ * @param {string} msgname String containing the name of the message to get.
+ * @param {Array} opt_args Optional array containing the argument values.
+ * @param {string} opt_default Optional value to return if the msgname is not
+ *     found.  Returns the message name by default.
+ */
+lib.MessageManager.prototype.get = function(msgname, opt_args, opt_default) {
+  var message;
+
+  if (msgname in this.messages) {
+    message = this.messages[msgname];
+
+  } else {
+    if (window.chrome.i18n)
+      message = chrome.i18n.getMessage(msgname);
+
+    if (!message) {
+      console.warn('Unknown message: ' + msgname);
+      return (typeof opt_default == 'undefined') ? msgname : opt_default;
+    }
+  }
+
+  if (!opt_args)
+    return message;
+
+  if (!(opt_args instanceof Array))
+    opt_args = [opt_args];
+
+  return this.replaceReferences(message, opt_args);
+};
+
+/**
+ * Process all of the "i18n" html attributes found in a given dom fragment.
+ *
+ * Each i18n attribute should contain a JSON object.  The keys are taken to
+ * be attribute names, and the values are message names.
+ *
+ * If the JSON object has a "_" (underscore) key, it's value is used as the
+ * textContent of the element.
+ *
+ * Message names can refer to other attributes on the same element with by
+ * prefixing with a dollar sign.  For example...
+ *
+ *   <button id='send-button'
+ *           i18n='{"aria-label": "$id", "_": "SEND_BUTTON_LABEL"}'
+ *           ></button>
+ *
+ * The aria-label message name will be computed as "SEND_BUTTON_ARIA_LABEL".
+ * Notice that the "id" attribute was appended to the target attribute, and
+ * the result converted to UPPER_AND_UNDER style.
+ */
+lib.MessageManager.prototype.processI18nAttributes = function(dom) {
+  // Convert the "lower-and-dashes" attribute names into
+  // "UPPER_AND_UNDER" style.
+  function thunk(str) { return str.replace(/-/g, '_').toUpperCase() }
+
+  var nodes = dom.querySelectorAll('[i18n]');
+
+  for (var i = 0; i < nodes.length; i++) {
+    var node = nodes[i];
+    var i18n = node.getAttribute('i18n');
+
+    if (!i18n)
+      continue;
+
+    try {
+      i18n = JSON.parse(i18n);
+    } catch (ex) {
+      console.error('Can\'t parse ' + node.tagName + '#' + node.id + ': ' +
+                    i18n);
+      throw ex;
+    }
+
+    for (var key in i18n) {
+      var msgname = i18n[key];
+      if (msgname.substr(0, 1) == '$')
+        msgname = thunk(node.getAttribute(msgname.substr(1)) + '_' + key);
+
+      var msg = this.get(msgname);
+      if (key == '_') {
+        node.textContent = msg;
+      } else {
+        node.setAttribute(key, msg);
+      }
+    }
+  }
+};
+// SOURCE FILE: libdot/js/lib_preference_manager.js
+// Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+'use strict';
+
+/**
+ * Constructor for lib.PreferenceManager objects.
+ *
+ * These objects deal with persisting changes to stable storage and notifying
+ * consumers when preferences change.
+ *
+ * It is intended that the backing store could be something other than HTML5
+ * storage, but there aren't any use cases at the moment.  In the future there
+ * may be a chrome api to store sync-able name/value pairs, and we'd want
+ * that.
+ *
+ * @param {lib.Storage.*} storage The storage object to use as a backing
+ *     store.
+ * @param {string} opt_prefix The optional prefix to be used for all preference
+ *     names.  The '/' character should be used to separate levels of heirarchy,
+ *     if you're going to have that kind of thing.  If provided, the prefix
+ *     should start with a '/'.  If not provided, it defaults to '/'.
+ */
+lib.PreferenceManager = function(storage, opt_prefix) {
+  this.storage = storage;
+  this.storageObserver_ = this.onStorageChange_.bind(this);
+
+  this.isActive_ = false;
+  this.activate();
+
+  this.trace = false;
+
+  var prefix = opt_prefix || '/';
+  if (prefix.substr(prefix.length - 1) != '/')
+    prefix += '/';
+
+  this.prefix = prefix;
+
+  this.prefRecords_ = {};
+  this.globalObservers_ = [];
+
+  this.childFactories_ = {};
+
+  // Map of list-name to {map of child pref managers}
+  // As in...
+  //
+  //  this.childLists_ = {
+  //    'profile-ids': {
+  //      'one': PreferenceManager,
+  //      'two': PreferenceManager,
+  //      ...
+  //    },
+  //
+  //    'frob-ids': {
+  //      ...
+  //    }
+  //  }
+  this.childLists_ = {};
+};
+
+/**
+ * Used internally to indicate that the current value of the preference should
+ * be taken from the default value defined with the preference.
+ *
+ * Equality tests against this value MUST use '===' or '!==' to be accurate.
+ */
+lib.PreferenceManager.prototype.DEFAULT_VALUE = new String('DEFAULT');
+
+/**
+ * An individual preference.
+ *
+ * These objects are managed by the PreferenceManager, you shoudn't need to
+ * handle them directly.
+ */
+lib.PreferenceManager.Record = function(name, defaultValue) {
+  this.name = name;
+  this.defaultValue = defaultValue;
+  this.currentValue = this.DEFAULT_VALUE;
+  this.observers = [];
+};
+
+/**
+ * A local copy of the DEFAULT_VALUE constant to make it less verbose.
+ */
+lib.PreferenceManager.Record.prototype.DEFAULT_VALUE =
+    lib.PreferenceManager.prototype.DEFAULT_VALUE;
+
+/**
+ * Register a callback to be invoked when this preference changes.
+ *
+ * @param {function(value, string, lib.PreferenceManager} observer The function
+ *     to invoke.  It will receive the new value, the name of the preference,
+ *     and a reference to the PreferenceManager as parameters.
+ */
+lib.PreferenceManager.Record.prototype.addObserver = function(observer) {
+  this.observers.push(observer);
+};
+
+/**
+ * Unregister an observer callback.
+ *
+ * @param {function} observer A previously registered callback.
+ */
+lib.PreferenceManager.Record.prototype.removeObserver = function(observer) {
+  var i = this.observers.indexOf(observer);
+  if (i >= 0)
+    this.observers.splice(i, 1);
+};
+
+/**
+ * Fetch the value of this preference.
+ */
+lib.PreferenceManager.Record.prototype.get = function() {
+  if (this.currentValue === this.DEFAULT_VALUE) {
+    if (/^(string|number)$/.test(typeof this.defaultValue))
+      return this.defaultValue;
+
+    if (typeof this.defaultValue == 'object') {
+      // We want to return a COPY of the default value so that users can
+      // modify the array or object without changing the default value.
+      return JSON.parse(JSON.stringify(this.defaultValue));
+    }
+
+    return this.defaultValue;
+  }
+
+  return this.currentValue;
+};
+
+/**
+ * Stop this preference manager from tracking storage changes.
+ *
+ * Call this if you're going to swap out one preference manager for another so
+ * that you don't get notified about irrelevant changes.
+ */
+lib.PreferenceManager.prototype.deactivate = function() {
+  if (!this.isActive_)
+    throw new Error('Not activated');
+
+  this.isActive_ = false;
+  this.storage.removeObserver(this.storageObserver_);
+};
+
+/**
+ * Start tracking storage changes.
+ *
+ * If you previously deactivated this preference manager, you can reactivate it
+ * with this method.  You don't need to call this at initialization time, as
+ * it's automatically called as part of the constructor.
+ */
+lib.PreferenceManager.prototype.activate = function() {
+  if (this.isActive_)
+    throw new Error('Already activated');
+
+  this.isActive_ = true;
+  this.storage.addObserver(this.storageObserver_);
+};
+
+/**
+ * Read the backing storage for these preferences.
+ *
+ * You should do this once at initialization time to prime the local cache
+ * of preference values.  The preference manager will monitor the backing
+ * storage for changes, so you should not need to call this more than once.
+ *
+ * This function recursively reads storage for all child preference managers as
+ * well.
+ *
+ * This function is asynchronous, if you need to read preference values, you
+ * *must* wait for the callback.
+ *
+ * @param {function()} opt_callback Optional function to invoke when the read
+ *     has completed.
+ */
+lib.PreferenceManager.prototype.readStorage = function(opt_callback) {
+  var pendingChildren = 0;
+
+  function onChildComplete() {
+    if (--pendingChildren == 0 && opt_callback)
+      opt_callback();
+  }
+
+  var keys = Object.keys(this.prefRecords_).map(
+      function(el) { return this.prefix + el }.bind(this));
+
+  if (this.trace)
+    console.log('Preferences read: ' + this.prefix);
+
+  this.storage.getItems(keys, function(items) {
+      var prefixLength = this.prefix.length;
+
+      for (var key in items) {
+        var value = items[key];
+        var name = key.substr(prefixLength);
+        var needSync = (name in this.childLists_ &&
+                        (JSON.stringify(value) !=
+                         JSON.stringify(this.prefRecords_[name].currentValue)));
+
+        this.prefRecords_[name].currentValue = value;
+
+        if (needSync) {
+          pendingChildren++;
+          this.syncChildList(name, onChildComplete);
+        }
+      }
+
+      if (pendingChildren == 0 && opt_callback)
+        setTimeout(opt_callback);
+    }.bind(this));
+};
+
+/**
+ * Define a preference.
+ *
+ * This registers a name, default value, and onChange handler for a preference.
+ *
+ * @param {string} name The name of the preference.  This will be prefixed by
+ *     the prefix of this PreferenceManager before written to local storage.
+ * @param {string|number|boolean|Object|Array|null} value The default value of
+ *     this preference.  Anything that can be represented in JSON is a valid
+ *     default value.
+ * @param {function(value, string, lib.PreferenceManager} opt_observer A
+ *     function to invoke when the preference changes.  It will receive the new
+ *     value, the name of the preference, and a reference to the
+ *     PreferenceManager as parameters.
+ */
+lib.PreferenceManager.prototype.definePreference = function(
+    name, value, opt_onChange) {
+
+  var record = this.prefRecords_[name];
+  if (record) {
+    this.changeDefault(name, value);
+  } else {
+    record = this.prefRecords_[name] =
+        new lib.PreferenceManager.Record(name, value);
+  }
+
+  if (opt_onChange)
+    record.addObserver(opt_onChange);
+};
+
+/**
+ * Define multiple preferences with a single function call.
+ *
+ * @param {Array} defaults An array of 3-element arrays.  Each three element
+ *     array should contain the [key, value, onChange] parameters for a
+ *     preference.
+ */
+lib.PreferenceManager.prototype.definePreferences = function(defaults) {
+  for (var i = 0; i < defaults.length; i++) {
+    this.definePreference(defaults[i][0], defaults[i][1], defaults[i][2]);
+  }
+};
+
+/**
+ * Define an ordered list of child preferences.
+ *
+ * Child preferences are different from just storing an array of JSON objects
+ * in that each child is an instance of a preference manager.  This means you
+ * can observe changes to individual child preferences, and get some validation
+ * that you're not reading or writing to an undefined child preference value.
+ *
+ * @param {string} listName A name for the list of children.  This must be
+ *     unique in this preference manager.  The listName will become a
+ *     preference on this PreferenceManager used to store the ordered list of
+ *     child ids.  It is also used in get/add/remove operations to identify the
+ *     list of children to operate on.
+ * @param {function} childFactory A function that will be used to generate
+ *     instances of these childred.  The factory function will receive the
+ *     parent lib.PreferenceManager object and a unique id for the new child
+ *     preferences.
+ */
+lib.PreferenceManager.prototype.defineChildren = function(
+    listName, childFactory) {
+
+  // Define a preference to hold the ordered list of child ids.
+  this.definePreference(listName, [],
+                        this.onChildListChange_.bind(this, listName));
+  this.childFactories_[listName] = childFactory;
+  this.childLists_[listName] = {};
+};
+
+/**
+ * Register to observe preference changes.
+ *
+ * @param {Function} global A callback that will happen for every preference.
+ *     Pass null if you don't need one.
+ * @param {Object} map A map of preference specific callbacks.  Pass null if
+ *     you don't need any.
+ */
+lib.PreferenceManager.prototype.addObservers = function(global, map) {
+  if (global && typeof global != 'function')
+    throw new Error('Invalid param: globals');
+
+  if (global)
+    this.globalObservers_.push(global);
+
+  if (!map)
+    return;
+
+  for (var name in map) {
+    if (!(name in this.prefRecords_))
+      throw new Error('Unknown preference: ' + name);
+
+    this.prefRecords_[name].addObserver(map[name]);
+  }
+};
+
+/**
+ * Dispatch the change observers for all known preferences.
+ *
+ * It may be useful to call this after readStorage completes, in order to
+ * get application state in sync with user preferences.
+ *
+ * This can be used if you've changed a preference manager out from under
+ * a live object, for example when switching to a different prefix.
+ */
+lib.PreferenceManager.prototype.notifyAll = function() {
+  for (var name in this.prefRecords_) {
+    this.notifyChange_(name);
+  }
+};
+
+/**
+ * Notify the change observers for a given preference.
+ *
+ * @param {string} name The name of the preference that changed.
+ */
+lib.PreferenceManager.prototype.notifyChange_ = function(name) {
+  var record = this.prefRecords_[name];
+  if (!record)
+    throw new Error('Unknown preference: ' + name);
+
+  var currentValue = record.get();
+
+  for (var i = 0; i < this.globalObservers_.length; i++)
+    this.globalObservers_[i](name, currentValue);
+
+  for (var i = 0; i < record.observers.length; i++) {
+    record.observers[i](currentValue, name, this);
+  }
+};
+
+/**
+ * Create a new child PreferenceManager for the given child list.
+ *
+ * The optional hint parameter is an opaque prefix added to the auto-generated
+ * unique id for this child.  Your child factory can parse out the prefix
+ * and use it.
+ *
+ * @param {string} listName The child list to create the new instance from.
+ * @param {string} opt_hint Optional hint to include in the child id.
+ * @param {string} opt_id Optional id to override the generated id.
+ */
+lib.PreferenceManager.prototype.createChild = function(listName, opt_hint,
+                                                       opt_id) {
+  var ids = this.get(listName);
+  var id;
+
+  if (opt_id) {
+    id = opt_id;
+    if (ids.indexOf(id) != -1)
+      throw new Error('Duplicate child: ' + listName + ': ' + id);
+
+  } else {
+    // Pick a random, unique 4-digit hex identifier for the new profile.
+    while (!id || ids.indexOf(id) != -1) {
+      id = Math.floor(Math.random() * 0xffff + 1).toString(16);
+      id = lib.f.zpad(id, 4);
+      if (opt_hint)
+        id = opt_hint + ':' + id;
+    }
+  }
+
+  var childManager = this.childFactories_[listName](this, id);
+  childManager.trace = this.trace;
+  childManager.resetAll();
+
+  this.childLists_[listName][id] = childManager;
+
+  ids.push(id);
+  this.set(listName, ids);
+
+  return childManager;
+};
+
+/**
+ * Remove a child preferences instance.
+ *
+ * Removes a child preference manager and clears any preferences stored in it.
+ *
+ * @param {string} listName The name of the child list containing the child to
+ *     remove.
+ * @param {string} id The child ID.
+ */
+lib.PreferenceManager.prototype.removeChild = function(listName, id) {
+  var prefs = this.getChild(listName, id);
+  prefs.resetAll();
+
+  var ids = this.get(listName);
+  var i = ids.indexOf(id);
+  if (i != -1) {
+    ids.splice(i, 1);
+    this.set(listName, ids);
+  }
+
+  delete this.childLists_[listName][id];
+};
+
+/**
+ * Return a child PreferenceManager instance for a given id.
+ *
+ * If the child list or child id is not known this will return the specified
+ * default value or throw an exception if no default value is provided.
+ *
+ * @param {string} listName The child list to look in.
+ * @param {string} id The child ID.
+ * @param {*} opt_default The optional default value to return if the child
+ *     is not found.
+ */
+lib.PreferenceManager.prototype.getChild = function(listName, id, opt_default) {
+  if (!(listName in this.childLists_))
+    throw new Error('Unknown child list: ' + listName);
+
+  var childList = this.childLists_[listName];
+  if (!(id in childList)) {
+    if (typeof opt_default == 'undefined')
+      throw new Error('Unknown "' + listName + '" child: ' + id);
+
+    return opt_default;
+  }
+
+  return childList[id];
+};
+
+/**
+ * Calculate the difference between two lists of child ids.
+ *
+ * Given two arrays of child ids, this function will return an object
+ * with "added", "removed", and "common" properties.  Each property is
+ * a map of child-id to `true`.  For example, given...
+ *
+ *    a = ['child-x', 'child-y']
+ *    b = ['child-y']
+ *
+ *    diffChildLists(a, b) =>
+ *      { added: { 'child-x': true }, removed: {}, common: { 'child-y': true } }
+ *
+ * The added/removed properties assume that `a` is the current list.
+ *
+ * @param {Array[string]} a The most recent list of child ids.
+ * @param {Array[string]} b An older list of child ids.
+ * @return {Object} An object with added/removed/common properties.
+ */
+lib.PreferenceManager.diffChildLists = function(a, b) {
+  var rv = {
+    added: {},
+    removed: {},
+    common: {},
+  };
+
+  for (var i = 0; i < a.length; i++) {
+    if (b.indexOf(a[i]) != -1) {
+      rv.common[a[i]] = true;
+    } else {
+      rv.added[a[i]] = true;
+    }
+  }
+
+  for (var i = 0; i < b.length; i++) {
+    if ((b[i] in rv.added) || (b[i] in rv.common))
+      continue;
+
+    rv.removed[b[i]] = true;
+  }
+
+  return rv;
+};
+
+/**
+ * Synchronize a list of child PreferenceManagers instances with the current
+ * list stored in prefs.
+ *
+ * This will instantiate any missing managers and read current preference values
+ * from storage.  Any active managers that no longer appear in preferences will
+ * be deleted.
+ *
+ * @param {string} listName The child list to synchronize.
+ * @param {function()} opt_callback Optional function to invoke when the sync
+ *     is complete.
+ */
+lib.PreferenceManager.prototype.syncChildList = function(
+    listName, opt_callback) {
+
+  var pendingChildren = 0;
+  function onChildStorage() {
+    if (--pendingChildren == 0 && opt_callback)
+      opt_callback();
+  }
+
+  // The list of child ids that we *should* have a manager for.
+  var currentIds = this.get(listName);
+
+  // The known managers at the start of the sync.  Any manager still in this
+  // list at the end should be discarded.
+  var oldIds = Object.keys(this.childLists_[listName]);
+
+  var rv = lib.PreferenceManager.diffChildLists(currentIds, oldIds);
+
+  for (var i = 0; i < currentIds.length; i++) {
+    var id = currentIds[i];
+
+    var managerIndex = oldIds.indexOf(id);
+    if (managerIndex >= 0)
+      oldIds.splice(managerIndex, 1);
+
+    if (!this.childLists_[listName][id]) {
+      var childManager = this.childFactories_[listName](this, id);
+      if (!childManager) {
+        console.warn('Unable to restore child: ' + listName + ': ' + id);
+        continue;
+      }
+
+      childManager.trace = this.trace;
+      this.childLists_[listName][id] = childManager;
+      pendingChildren++;
+      childManager.readStorage(onChildStorage);
+    }
+  }
+
+  for (var i = 0; i < oldIds.length; i++) {
+    delete this.childLists_[listName][oldIds[i]];
+  }
+
+  if (!pendingChildren && opt_callback)
+    setTimeout(opt_callback);
+};
+
+/**
+ * Reset a preference to its default state.
+ *
+ * This will dispatch the onChange handler if the preference value actually
+ * changes.
+ *
+ * @param {string} name The preference to reset.
+ */
+lib.PreferenceManager.prototype.reset = function(name) {
+  var record = this.prefRecords_[name];
+  if (!record)
+    throw new Error('Unknown preference: ' + name);
+
+  this.storage.removeItem(this.prefix + name);
+
+  if (record.currentValue !== this.DEFAULT_VALUE) {
+    record.currentValue = this.DEFAULT_VALUE;
+    this.notifyChange_(name);
+  }
+};
+
+/**
+ * Reset all preferences back to their default state.
+ */
+lib.PreferenceManager.prototype.resetAll = function() {
+  var changed = [];
+
+  for (var listName in this.childLists_) {
+    var childList = this.childLists_[listName];
+    for (var id in childList) {
+      childList[id].resetAll();
+    }
+  }
+
+  for (var name in this.prefRecords_) {
+    if (this.prefRecords_[name].currentValue !== this.DEFAULT_VALUE) {
+      this.prefRecords_[name].currentValue = this.DEFAULT_VALUE;
+      changed.push(name);
+    }
+  }
+
+  var keys = Object.keys(this.prefRecords_).map(function(el) {
+      return this.prefix + el;
+  }.bind(this));
+
+  this.storage.removeItems(keys);
+
+  changed.forEach(this.notifyChange_.bind(this));
+};
+
+/**
+ * Return true if two values should be considered not-equal.
+ *
+ * If both values are the same scalar type and compare equal this function
+ * returns false (no difference), otherwise return true.
+ *
+ * This is used in places where we want to check if a preference has changed.
+ * Rather than take the time to compare complex values we just consider them
+ * to always be different.
+ *
+ * @param {*} a A value to compare.
+ * @param {*} b A value to compare.
+ */
+lib.PreferenceManager.prototype.diff = function(a, b) {
+  // If the types are different, or the type is not a simple primitive one.
+  if ((typeof a) !== (typeof b) ||
+      !(/^(undefined|boolean|number|string)$/.test(typeof a))) {
+    return true;
+  }
+
+  return a !== b;
+};
+
+/**
+ * Change the default value of a preference.
+ *
+ * This is useful when subclassing preference managers.
+ *
+ * The function does not alter the current value of the preference, unless
+ * it has the old default value.  When that happens, the change observers
+ * will be notified.
+ *
+ * @param {string} name The name of the parameter to change.
+ * @param {*} newValue The new default value for the preference.
+ */
+lib.PreferenceManager.prototype.changeDefault = function(name, newValue) {
+  var record = this.prefRecords_[name];
+  if (!record)
+    throw new Error('Unknown preference: ' + name);
+
+  if (!this.diff(record.defaultValue, newValue)) {
+    // Default value hasn't changed.
+    return;
+  }
+
+  if (record.currentValue !== this.DEFAULT_VALUE) {
+    // This pref has a specific value, just change the default and we're done.
+    record.defaultValue = newValue;
+    return;
+  }
+
+  record.defaultValue = newValue;
+
+  this.notifyChange_(name);
+};
+
+/**
+ * Change the default value of multiple preferences.
+ *
+ * @param {Object} map A map of name -> value pairs specifying the new default
+ *     values.
+ */
+lib.PreferenceManager.prototype.changeDefaults = function(map) {
+  for (var key in map) {
+    this.changeDefault(key, map[key]);
+  }
+};
+
+/**
+ * Set a preference to a specific value.
+ *
+ * This will dispatch the onChange handler if the preference value actually
+ * changes.
+ *
+ * @param {string} key The preference to set.
+ * @param {*} value The value to set.  Anything that can be represented in
+ *     JSON is a valid value.
+ */
+lib.PreferenceManager.prototype.set = function(name, newValue) {
+  var record = this.prefRecords_[name];
+  if (!record)
+    throw new Error('Unknown preference: ' + name);
+
+  var oldValue = record.get();
+
+  if (!this.diff(oldValue, newValue))
+    return;
+
+  if (this.diff(record.defaultValue, newValue)) {
+    record.currentValue = newValue;
+    this.storage.setItem(this.prefix + name, newValue);
+  } else {
+    record.currentValue = this.DEFAULT_VALUE;
+    this.storage.removeItem(this.prefix + name);
+  }
+
+  // We need to manually send out the notification on this instance.  If we
+  // The storage event won't fire a notification because we've already changed
+  // the currentValue, so it won't see a difference.  If we delayed changing
+  // currentValue until the storage event, a pref read immediately after a write
+  // would return the previous value.
+  //
+  // The notification is in a timeout so clients don't accidentally depend on
+  // a synchronous notification.
+  setTimeout(this.notifyChange_.bind(this, name), 0);
+};
+
+/**
+ * Get the value of a preference.
+ *
+ * @param {string} key The preference to get.
+ */
+lib.PreferenceManager.prototype.get = function(name) {
+  var record = this.prefRecords_[name];
+  if (!record)
+    throw new Error('Unknown preference: ' + name);
+
+  return record.get();
+};
+
+/**
+ * Return all non-default preferences as a JSON onject.
+ *
+ * This includes any nested preference managers as well.
+ */
+lib.PreferenceManager.prototype.exportAsJson = function() {
+  var rv = {};
+
+  for (var name in this.prefRecords_) {
+    if (name in this.childLists_) {
+      rv[name] = [];
+      var childIds = this.get(name);
+      for (var i = 0; i < childIds.length; i++) {
+        var id = childIds[i];
+        rv[name].push({id: id, json: this.getChild(name, id).exportAsJson()});
+      }
+
+    } else {
+      var record = this.prefRecords_[name];
+      if (record.currentValue != this.DEFAULT_VALUE)
+        rv[name] = record.currentValue;
+    }
+  }
+
+  return rv;
+};
+
+/**
+ * Import a JSON blob of preferences previously generated with exportAsJson.
+ *
+ * This will create nested preference managers as well.
+ */
+lib.PreferenceManager.prototype.importFromJson = function(json) {
+  for (var name in json) {
+    if (name in this.childLists_) {
+      var childList = json[name];
+      for (var i = 0; i < childList.length; i++) {
+        var id = childList[i].id;
+
+        var childPrefManager = this.childLists_[name][id];
+        if (!childPrefManager)
+          childPrefManager = this.createChild(name, null, id);
+
+        childPrefManager.importFromJson(childList[i].json);
+      }
+
+    } else {
+      this.set(name, json[name]);
+    }
+  }
+};
+
+/**
+ * Called when one of the child list preferences changes.
+ */
+lib.PreferenceManager.prototype.onChildListChange_ = function(listName) {
+  this.syncChildList(listName);
+};
+
+/**
+ * Called when a key in the storage changes.
+ */
+lib.PreferenceManager.prototype.onStorageChange_ = function(map) {
+  for (var key in map) {
+    if (this.prefix) {
+      if (key.lastIndexOf(this.prefix, 0) != 0)
+        continue;
+    }
+
+    var name = key.substr(this.prefix.length);
+
+    if (!(name in this.prefRecords_)) {
+      // Sometimes we'll get notified about prefs that are no longer defined.
+      continue;
+    }
+
+    var record = this.prefRecords_[name];
+
+    var newValue = map[key].newValue;
+    var currentValue = record.currentValue;
+    if (currentValue === record.DEFAULT_VALUE)
+      currentValue = (void 0);
+
+    if (this.diff(currentValue, newValue)) {
+      if (typeof newValue == 'undefined') {
+        record.currentValue = record.DEFAULT_VALUE;
+      } else {
+        record.currentValue = newValue;
+      }
+
+      this.notifyChange_(name);
+    }
+  }
+};
+// SOURCE FILE: libdot/js/lib_resource.js
+// Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+'use strict';
+
+/**
+ * Storage for canned resources.
+ *
+ * These are usually non-JavaScript things that are collected during a build
+ * step and converted into a series of 'lib.resource.add(...)' calls.  See
+ * the "@resource" directive from libdot/bin/concat.sh for the canonical use
+ * case.
+ *
+ * This is global storage, so you should prefix your resource names to avoid
+ * collisions.
+ */
+lib.resource = {
+  resources_: {}
+};
+
+/**
+ * Add a resource.
+ *
+ * @param {string} name A name for the resource.  You should prefix this to
+ *   avoid collisions with resources from a shared library.
+ * @param {string} type A mime type for the resource, or "raw" if not
+ *   applicable.
+ * @param {*} data The value of the resource.
+ */
+lib.resource.add = function(name, type, data) {
+  lib.resource.resources_[name] = {
+    type: type,
+    name: name,
+    data: data
+  };
+};
+
+/**
+ * Retrieve a resource record.
+ *
+ * The resource data is stored on the "data" property of the returned object.
+ *
+ * @param {string} name The name of the resource to get.
+ * @param {*} opt_defaultValue The optional value to return if the resource is
+ *   not defined.
+ * @return {object} An object with "type", "name", and "data" properties.
+ */
+lib.resource.get = function(name, opt_defaultValue) {
+  if (!(name in lib.resource.resources_)) {
+    if (typeof opt_defaultValue == 'undefined')
+      throw 'Unknown resource: ' + name;
+
+    return opt_defaultValue;
+  }
+
+  return lib.resource.resources_[name];
+};
+
+/**
+ * Retrieve resource data.
+ *
+ * @param {string} name The name of the resource to get.
+ * @param {*} opt_defaultValue The optional value to return if the resource is
+ *   not defined.
+ * @return {*} The resource data.
+ */
+lib.resource.getData = function(name, opt_defaultValue) {
+  if (!(name in lib.resource.resources_)) {
+    if (typeof opt_defaultValue == 'undefined')
+      throw 'Unknown resource: ' + name;
+
+    return opt_defaultValue;
+  }
+
+  return lib.resource.resources_[name].data;
+};
+
+/**
+ * Retrieve resource as a data: url.
+ *
+ * @param {string} name The name of the resource to get.
+ * @param {*} opt_defaultValue The optional value to return if the resource is
+ *   not defined.
+ * @return {*} A data: url encoded version of the resource.
+ */
+lib.resource.getDataUrl = function(name, opt_defaultValue) {
+  var resource = lib.resource.get(name, opt_defaultValue);
+  return 'data:' + resource.type + ',' + resource.data;
+};
+// SOURCE FILE: libdot/js/lib_storage.js
+// Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+'use strict';
+
+/**
+ * Namespace for implementations of persistent, possibly cloud-backed
+ * storage.
+ */
+lib.Storage = new Object();
+// SOURCE FILE: libdot/js/lib_storage_chrome.js
+// Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+'use strict';
+
+/**
+ * chrome.storage based class with an async interface that is interchangeable
+ * with other lib.Storage.* implementations.
+ */
+lib.Storage.Chrome = function(storage) {
+  this.storage_ = storage;
+  this.observers_ = [];
+
+  chrome.storage.onChanged.addListener(this.onChanged_.bind(this));
+};
+
+/**
+ * Called by the storage implementation when the storage is modified.
+ */
+lib.Storage.Chrome.prototype.onChanged_ = function(changes, areaname) {
+  if (chrome.storage[areaname] != this.storage_)
+    return;
+
+  for (var i = 0; i < this.observers_.length; i++) {
+    this.observers_[i](changes);
+  }
+};
+
+/**
+ * Register a function to observe storage changes.
+ *
+ * @param {function(map)} callback The function to invoke when the storage
+ *     changes.
+ */
+lib.Storage.Chrome.prototype.addObserver = function(callback) {
+  this.observers_.push(callback);
+};
+
+/**
+ * Unregister a change observer.
+ *
+ * @param {function} observer A previously registered callback.
+ */
+lib.Storage.Chrome.prototype.removeObserver = function(callback) {
+  var i = this.observers_.indexOf(callback);
+  if (i != -1)
+    this.observers_.splice(i, 1);
+};
+
+/**
+ * Delete everything in this storage.
+ *
+ * @param {function(map)} callback The function to invoke when the delete
+ *     has completed.
+ */
+lib.Storage.Chrome.prototype.clear = function(opt_callback) {
+  this.storage_.clear();
+
+  if (opt_callback)
+    setTimeout(opt_callback, 0);
+};
+
+/**
+ * Return the current value of a storage item.
+ *
+ * @param {string} key The key to look up.
+ * @param {function(value) callback The function to invoke when the value has
+ *     been retrieved.
+ */
+lib.Storage.Chrome.prototype.getItem = function(key, callback) {
+  this.storage_.get(key, callback);
+};
+/**
+ * Fetch the values of multiple storage items.
+ *
+ * @param {Array} keys The keys to look up.
+ * @param {function(map) callback The function to invoke when the values have
+ *     been retrieved.
+ */
+
+lib.Storage.Chrome.prototype.getItems = function(keys, callback) {
+  this.storage_.get(keys, callback);
+};
+
+/**
+ * Set a value in storage.
+ *
+ * @param {string} key The key for the value to be stored.
+ * @param {*} value The value to be stored.  Anything that can be serialized
+ *     with JSON is acceptable.
+ * @param {function()} opt_callback Optional function to invoke when the
+ *     set is complete.  You don't have to wait for the set to complete in order
+ *     to read the value, since the local cache is updated synchronously.
+ */
+lib.Storage.Chrome.prototype.setItem = function(key, value, opt_callback) {
+  var obj = {};
+  obj[key] = value;
+  this.storage_.set(obj, opt_callback);
+};
+
+/**
+ * Set multiple values in storage.
+ *
+ * @param {Object} map A map of key/values to set in storage.
+ * @param {function()} opt_callback Optional function to invoke when the
+ *     set is complete.  You don't have to wait for the set to complete in order
+ *     to read the value, since the local cache is updated synchronously.
+ */
+lib.Storage.Chrome.prototype.setItems = function(obj, opt_callback) {
+  this.storage_.set(obj, opt_callback);
+};
+
+/**
+ * Remove an item from storage.
+ *
+ * @param {string} key The key to be removed.
+ * @param {function()} opt_callback Optional function to invoke when the
+ *     remove is complete.  You don't have to wait for the set to complete in
+ *     order to read the value, since the local cache is updated synchronously.
+ */
+lib.Storage.Chrome.prototype.removeItem = function(key, opt_callback) {
+  this.storage_.remove(key, opt_callback);
+};
+
+/**
+ * Remove multiple items from storage.
+ *
+ * @param {Array} keys The keys to be removed.
+ * @param {function()} opt_callback Optional function to invoke when the
+ *     remove is complete.  You don't have to wait for the set to complete in
+ *     order to read the value, since the local cache is updated synchronously.
+ */
+lib.Storage.Chrome.prototype.removeItems = function(keys, opt_callback) {
+  this.storage_.remove(keys, opt_callback);
+};
+// SOURCE FILE: libdot/js/lib_storage_local.js
+// Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+'use strict';
+
+/**
+ * window.localStorage based class with an async interface that is
+ * interchangeable with other lib.Storage.* implementations.
+ */
+lib.Storage.Local = function() {
+  this.observers_ = [];
+  this.storage_ = window.localStorage;
+  window.addEventListener('storage', this.onStorage_.bind(this));
+};
+
+/**
+ * Called by the storage implementation when the storage is modified.
+ */
+lib.Storage.Local.prototype.onStorage_ = function(e) {
+  if (e.storageArea != this.storage_)
+    return;
+
+  // IE throws an exception if JSON.parse is given an empty string.
+  var prevValue = e.oldValue ? JSON.parse(e.oldValue) : "";
+  var curValue = e.newValue ? JSON.parse(e.newValue) : "";
+  var o = {};
+  o[e.key] = {
+    oldValue: prevValue,
+    newValue: curValue
+  };
+
+  for (var i = 0; i < this.observers_.length; i++) {
+    this.observers_[i](o);
+  }
+};
+
+/**
+ * Register a function to observe storage changes.
+ *
+ * @param {function(map)} callback The function to invoke when the storage
+ *     changes.
+ */
+lib.Storage.Local.prototype.addObserver = function(callback) {
+  this.observers_.push(callback);
+};
+
+/**
+ * Unregister a change observer.
+ *
+ * @param {function} observer A previously registered callback.
+ */
+lib.Storage.Local.prototype.removeObserver = function(callback) {
+  var i = this.observers_.indexOf(callback);
+  if (i != -1)
+    this.observers_.splice(i, 1);
+};
+
+/**
+ * Delete everything in this storage.
+ *
+ * @param {function(map)} callback The function to invoke when the delete
+ *     has completed.
+ */
+lib.Storage.Local.prototype.clear = function(opt_callback) {
+  this.storage_.clear();
+
+  if (opt_callback)
+    setTimeout(opt_callback, 0);
+};
+
+/**
+ * Return the current value of a storage item.
+ *
+ * @param {string} key The key to look up.
+ * @param {function(value) callback The function to invoke when the value has
+ *     been retrieved.
+ */
+lib.Storage.Local.prototype.getItem = function(key, callback) {
+  var value = this.storage_.getItem(key);
+
+  if (typeof value == 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch (e) {
+      // If we can't parse the value, just return it unparsed.
+    }
+  }
+
+  setTimeout(callback.bind(null, value), 0);
+};
+
+/**
+ * Fetch the values of multiple storage items.
+ *
+ * @param {Array} keys The keys to look up.
+ * @param {function(map) callback The function to invoke when the values have
+ *     been retrieved.
+ */
+lib.Storage.Local.prototype.getItems = function(keys, callback) {
+  var rv = {};
+
+  for (var i = keys.length - 1; i >= 0; i--) {
+    var key = keys[i];
+    var value = this.storage_.getItem(key);
+    if (typeof value == 'string') {
+      try {
+        rv[key] = JSON.parse(value);
+      } catch (e) {
+        // If we can't parse the value, just return it unparsed.
+        rv[key] = value;
+      }
+    } else {
+      keys.splice(i, 1);
+    }
+  }
+
+  setTimeout(callback.bind(null, rv), 0);
+};
+
+/**
+ * Set a value in storage.
+ *
+ * @param {string} key The key for the value to be stored.
+ * @param {*} value The value to be stored.  Anything that can be serialized
+ *     with JSON is acceptable.
+ * @param {function()} opt_callback Optional function to invoke when the
+ *     set is complete.  You don't have to wait for the set to complete in order
+ *     to read the value, since the local cache is updated synchronously.
+ */
+lib.Storage.Local.prototype.setItem = function(key, value, opt_callback) {
+  this.storage_.setItem(key, JSON.stringify(value));
+
+  if (opt_callback)
+  setTimeout(opt_callback, 0);
+};
+
+/**
+ * Set multiple values in storage.
+ *
+ * @param {Object} map A map of key/values to set in storage.
+ * @param {function()} opt_callback Optional function to invoke when the
+ *     set is complete.  You don't have to wait for the set to complete in order
+ *     to read the value, since the local cache is updated synchronously.
+ */
+lib.Storage.Local.prototype.setItems = function(obj, opt_callback) {
+  for (var key in obj) {
+    this.storage_.setItem(key, JSON.stringify(obj[key]));
+  }
+
+  if (opt_callback)
+  setTimeout(opt_callback, 0);
+};
+
+/**
+ * Remove an item from storage.
+ *
+ * @param {string} key The key to be removed.
+ * @param {function()} opt_callback Optional function to invoke when the
+ *     remove is complete.  You don't have to wait for the set to complete in
+ *     order to read the value, since the local cache is updated synchronously.
+ */
+lib.Storage.Local.prototype.removeItem = function(key, opt_callback) {
+  this.storage_.removeItem(key);
+
+  if (opt_callback)
+  setTimeout(opt_callback, 0);
+};
+
+/**
+ * Remove multiple items from storage.
+ *
+ * @param {Array} keys The keys to be removed.
+ * @param {function()} opt_callback Optional function to invoke when the
+ *     remove is complete.  You don't have to wait for the set to complete in
+ *     order to read the value, since the local cache is updated synchronously.
+ */
+lib.Storage.Local.prototype.removeItems = function(ary, opt_callback) {
+  for (var i = 0; i < ary.length; i++) {
+    this.storage_.removeItem(ary[i]);
+  }
+
+  if (opt_callback)
+  setTimeout(opt_callback, 0);
+};
+// SOURCE FILE: libdot/js/lib_storage_memory.js
+// Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+'use strict';
+
+/**
+ * In-memory storage class with an async interface that is interchangeable with
+ * other lib.Storage.* implementations.
+ */
+lib.Storage.Memory = function() {
+  this.observers_ = [];
+  this.storage_ = {};
+};
+
+/**
+ * Register a function to observe storage changes.
+ *
+ * @param {function(map)} callback The function to invoke when the storage
+ *     changes.
+ */
+lib.Storage.Memory.prototype.addObserver = function(callback) {
+  this.observers_.push(callback);
+};
+
+/**
+ * Unregister a change observer.
+ *
+ * @param {function} observer A previously registered callback.
+ */
+lib.Storage.Memory.prototype.removeObserver = function(callback) {
+  var i = this.observers_.indexOf(callback);
+  if (i != -1)
+    this.observers_.splice(i, 1);
+};
+
+/**
+ * Delete everything in this storage.
+ *
+ * @param {function(map)} callback The function to invoke when the delete
+ *     has completed.
+ */
+lib.Storage.Memory.prototype.clear = function(opt_callback) {
+  var e = {};
+  for (var key in this.storage_) {
+    e[key] = {oldValue: this.storage_[key], newValue: (void 0)};
+  }
+
+  this.storage_ = {};
+
+  setTimeout(function() {
+    for (var i = 0; i < this.observers_.length; i++) {
+      this.observers_[i](e);
+    }
+  }.bind(this), 0);
+
+  if (opt_callback)
+    setTimeout(opt_callback, 0);
+};
+
+/**
+ * Return the current value of a storage item.
+ *
+ * @param {string} key The key to look up.
+ * @param {function(value) callback The function to invoke when the value has
+ *     been retrieved.
+ */
+lib.Storage.Memory.prototype.getItem = function(key, callback) {
+  var value = this.storage_[key];
+
+  if (typeof value == 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch (e) {
+      // If we can't parse the value, just return it unparsed.
+    }
+  }
+
+  setTimeout(callback.bind(null, value), 0);
+};
+
+/**
+ * Fetch the values of multiple storage items.
+ *
+ * @param {Array} keys The keys to look up.
+ * @param {function(map) callback The function to invoke when the values have
+ *     been retrieved.
+ */
+lib.Storage.Memory.prototype.getItems = function(keys, callback) {
+  var rv = {};
+
+  for (var i = keys.length - 1; i >= 0; i--) {
+    var key = keys[i];
+    var value = this.storage_[key];
+    if (typeof value == 'string') {
+      try {
+        rv[key] = JSON.parse(value);
+      } catch (e) {
+        // If we can't parse the value, just return it unparsed.
+        rv[key] = value;
+      }
+    } else {
+      keys.splice(i, 1);
+    }
+  }
+
+  setTimeout(callback.bind(null, rv), 0);
+};
+
+/**
+ * Set a value in storage.
+ *
+ * @param {string} key The key for the value to be stored.
+ * @param {*} value The value to be stored.  Anything that can be serialized
+ *     with JSON is acceptable.
+ * @param {function()} opt_callback Optional function to invoke when the
+ *     set is complete.  You don't have to wait for the set to complete in order
+ *     to read the value, since the local cache is updated synchronously.
+ */
+lib.Storage.Memory.prototype.setItem = function(key, value, opt_callback) {
+  var oldValue = this.storage_[key];
+  this.storage_[key] = JSON.stringify(value);
+
+  var e = {};
+  e[key] = {oldValue: oldValue, newValue: value};
+
+  setTimeout(function() {
+    for (var i = 0; i < this.observers_.length; i++) {
+      this.observers_[i](e);
+    }
+  }.bind(this), 0);
+
+  if (opt_callback)
+  setTimeout(opt_callback, 0);
+};
+
+/**
+ * Set multiple values in storage.
+ *
+ * @param {Object} map A map of key/values to set in storage.
+ * @param {function()} opt_callback Optional function to invoke when the
+ *     set is complete.  You don't have to wait for the set to complete in order
+ *     to read the value, since the local cache is updated synchronously.
+ */
+lib.Storage.Memory.prototype.setItems = function(obj, opt_callback) {
+  var e = {};
+
+  for (var key in obj) {
+    e[key] = {oldValue: this.storage_[key], newValue: obj[key]};
+    this.storage_[key] = JSON.stringify(obj[key]);
+  }
+
+  setTimeout(function() {
+    for (var i = 0; i < this.observers_.length; i++) {
+      this.observers_[i](e);
+    }
+  }.bind(this));
+
+  if (opt_callback)
+  setTimeout(opt_callback, 0);
+};
+
+/**
+ * Remove an item from storage.
+ *
+ * @param {string} key The key to be removed.
+ * @param {function()} opt_callback Optional function to invoke when the
+ *     remove is complete.  You don't have to wait for the set to complete in
+ *     order to read the value, since the local cache is updated synchronously.
+ */
+lib.Storage.Memory.prototype.removeItem = function(key, opt_callback) {
+  delete this.storage_[key];
+
+  if (opt_callback)
+  setTimeout(opt_callback, 0);
+};
+
+/**
+ * Remove multiple items from storage.
+ *
+ * @param {Array} keys The keys to be removed.
+ * @param {function()} opt_callback Optional function to invoke when the
+ *     remove is complete.  You don't have to wait for the set to complete in
+ *     order to read the value, since the local cache is updated synchronously.
+ */
+lib.Storage.Memory.prototype.removeItems = function(ary, opt_callback) {
+  for (var i = 0; i < ary.length; i++) {
+    delete this.storage_[ary[i]];
+  }
+
+  if (opt_callback)
+  setTimeout(opt_callback, 0);
+};
+// SOURCE FILE: libdot/js/lib_test_manager.js
+// Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+'use strict';
+
+/**
+ * @fileoverview JavaScript unit testing framework for synchronous and
+ *     asynchronous tests.
+ *
+ * This file contains the lib.TestManager and related classes.  At the moment
+ * it's all collected in a single file since it's reasonably small
+ * (=~1k lines), and it's a lot easier to include one file into your test
+ * harness than it is to include seven.
+ *
+ * The following classes are defined...
+ *
+ *   lib.TestManager - The root class and entrypoint for creating test runs.
+ *   lib.TestManager.Log - Logging service.
+ *   lib.TestManager.Suite - A collection of tests.
+ *   lib.TestManager.Test - A single test.
+ *   lib.TestManager.TestRun - Manages the execution of a set of tests.
+ *   lib.TestManager.Result - A single test result.
+ */
+
+/**
+ * Root object in the unit test heirarchy, and keeper of the log object.
+ *
+ * @param {lib.TestManager.Log} opt_log Optional lib.TestManager.Log object.
+ *     Logs to the JavaScript console if ommitted.
+ */
+lib.TestManager = function(opt_log) {
+  this.log = opt_log || new lib.TestManager.Log();
+}
+
+/**
+ * Create a new test run object for this test manager.
+ *
+ * @param {Object} opt_cx An object to be passed to test suite setup(),
+ *     preamble(), and test cases during this test run.  This object is opaque
+ *     to lib.TestManager.* code.  It's entirely up to the test suite what it's
+ *     used for.
+ */
+lib.TestManager.prototype.createTestRun = function(opt_cx) {
+  return new lib.TestManager.TestRun(this, opt_cx);
+};
+
+/**
+ * Called when a test run associated with this test manager completes.
+ *
+ * Clients may override this to call an appropriate function.
+ */
+lib.TestManager.prototype.onTestRunComplete = function(testRun) {};
+
+/**
+ * Destination for test case output.
+ *
+ * @param {function(string)} opt_logFunction Optional function to call to
+ *     write a string to the log.  If ommitted, console.log is used.
+ */
+lib.TestManager.Log = function(opt_logFunction) {
+  this.logFunction_ = opt_logFunction || function(s) { console.log(s) };
+  this.pending_ = '';
+  this.prefix_ = '';
+  this.prefixStack_ = [];
+};
+
+/**
+ * Add a prefix to log messages.
+ *
+ * This only affects log messages that are added after the prefix is pushed.
+ *
+ * @param {string} str The prefix to prepend to future log messages.
+ */
+lib.TestManager.Log.prototype.pushPrefix = function(str) {
+  this.prefixStack_.push(str);
+  this.prefix_ = this.prefixStack_.join('');
+};
+
+/**
+ * Remove the most recently added message prefix.
+ */
+lib.TestManager.Log.prototype.popPrefix = function() {
+  this.prefixStack_.pop();
+  this.prefix_ = this.prefixStack_.join('');
+};
+
+/**
+ * Queue up a string to print to the log.
+ *
+ * If a line is already pending, this string is added to it.
+ *
+ * The string is not actually printed to the log until flush() or println()
+ * is called.  The following call sequence will result in TWO lines in the
+ * log...
+ *
+ *   log.print('hello');
+ *   log.print(' ');
+ *   log.println('world');
+ *
+ * While a typical stream-like thing would result in 'hello world\n', this one
+ * results in 'hello \nworld\n'.
+ *
+ * @param {string} str The string to add to the log.
+ */
+lib.TestManager.Log.prototype.print = function(str) {
+  if (this.pending_) {
+    this.pending_ += str;
+  } else {
+    this.pending_ = this.prefix_ + str;
+  }
+};
+
+/**
+ * Print a line to the log and flush it immediately.
+ *
+ * @param {string} str The string to add to the log.
+ */
+lib.TestManager.Log.prototype.println = function(str) {
+  if (this.pending_)
+    this.flush();
+
+  this.logFunction_(this.prefix_ + str);
+};
+
+/**
+ * Flush any pending log message.
+ */
+lib.TestManager.Log.prototype.flush = function() {
+  if (!this.pending_)
+    return;
+
+  this.logFunction_(this.pending_);
+  this.pending_ = '';
+};
+
+/**
+ * Returns a new constructor function that will inherit from
+ * lib.TestManager.Suite.
+ *
+ * Use this function to create a new test suite subclass.  It will return a
+ * properly initialized constructor function for the subclass.  You can then
+ * override the setup() and preamble() methods if necessary and add test cases
+ * to the subclass.
+ *
+ *   var MyTests = new lib.TestManager.Suite('MyTests');
+ *
+ *   MyTests.prototype.setup = function(cx) {
+ *     // Sets this.size to cx.size if it exists, or the default value of 10
+ *     // if not.
+ *     this.setDefault(cx, {size: 10});
+ *   };
+ *
+ *   MyTests.prototype.preamble = function(result, cx) {
+ *     // Some tests (even successful ones) may side-effect this list, so
+ *     // recreate it before every test.
+ *     this.list = [];
+ *     for (var i = 0; i < this.size; i++) {
+ *       this.list[i] = i;
+ *     }
+ *   };
+ *
+ *   // Basic synchronous test case.
+ *   MyTests.addTest('pop-length', function(result, cx) {
+ *       this.list.pop();
+ *
+ *       // If this assertion fails, the testcase will stop here.
+ *       result.assertEQ(this.list.length, this.size - 1);
+ *
+ *       // A test must indicate it has passed by calling this method.
+ *       result.pass();
+ *     });
+ *
+ *   // Sample asynchronous test case.
+ *   MyTests.addTest('async-pop-length', function(result, cx) {
+ *       var self = this;
+ *
+ *       var callback = function() {
+ *           result.assertEQ(self.list.length, self.size - 1);
+ *           result.pass();
+ *       };
+ *
+ *       // Wait 100ms to check the array length for the sake of this example.
+ *       setTimeout(callback, 100);
+ *
+ *       this.list.pop();
+ *
+ *       // Indicate that this test needs another 200ms to complete.
+ *       // If the test does not report pass/fail by then, it is considered to
+ *       // have timed out.
+ *       result.requestTime(200);
+ *     });
+ *
+ *   ...
+ *
+ * @param {string} suiteName The name of the test suite.
+ */
+lib.TestManager.Suite = function(suiteName) {
+  function ctor(testManager, cx) {
+    this.testManager_ = testManager;
+    this.suiteName = suiteName;
+
+    this.setup(cx);
+  }
+
+  ctor.suiteName = suiteName;
+  ctor.addTest = lib.TestManager.Suite.addTest;
+  ctor.disableTest = lib.TestManager.Suite.disableTest;
+  ctor.getTest = lib.TestManager.Suite.getTest;
+  ctor.getTestList = lib.TestManager.Suite.getTestList;
+  ctor.testList_ = [];
+  ctor.testMap_ = {};
+  ctor.prototype = { __proto__: lib.TestManager.Suite.prototype };
+
+  lib.TestManager.Suite.subclasses.push(ctor);
+
+  return ctor;
+};
+
+/**
+ * List of lib.TestManager.Suite subclasses, in the order they were defined.
+ */
+lib.TestManager.Suite.subclasses = [];
+
+/**
+ * Add a test to a lib.TestManager.Suite.
+ *
+ * This method is copied to new subclasses when they are created.
+ */
+lib.TestManager.Suite.addTest = function(testName, testFunction) {
+  if (testName in this.testMap_)
+    throw 'Duplicate test name: ' + testName;
+
+  var test = new lib.TestManager.Test(this, testName, testFunction);
+  this.testMap_[testName] = test;
+  this.testList_.push(test);
+};
+
+/**
+ * Defines a disabled test.
+ */
+lib.TestManager.Suite.disableTest = function(testName, testFunction) {
+  if (testName in this.testMap_)
+    throw 'Duplicate test name: ' + testName;
+
+  var test = new lib.TestManager.Test(this, testName, testFunction);
+  console.log('Disabled test: ' + test.fullName);
+};
+
+/**
+ * Get a lib.TestManager.Test instance by name.
+ *
+ * This method is copied to new subclasses when they are created.
+ *
+ * @param {string} testName The name of the desired test.
+ * @return {lib.TestManager.Test} The requested test, or undefined if it was not
+ *     found.
+ */
+lib.TestManager.Suite.getTest = function(testName) {
+  return this.testMap_[testName];
+};
+
+/**
+ * Get an array of lib.TestManager.Tests associated with this Suite.
+ *
+ * This method is copied to new subclasses when they are created.
+ */
+lib.TestManager.Suite.getTestList = function() {
+  return this.testList_;
+};
+
+/**
+ * Set properties on a test suite instance, pulling the property value from
+ * the context if it exists and from the defaults dictionary if not.
+ *
+ * This is intended to be used in your test suite's setup() method to
+ * define parameters for the test suite which may be overridden through the
+ * context object.  For example...
+ *
+ *   MySuite.prototype.setup = function(cx) {
+ *     this.setDefaults(cx, {size: 10});
+ *   };
+ *
+ * If the context object has a 'size' property then this.size will be set to
+ * the value of cx.size, otherwise this.size will get a default value of 10.
+ *
+ * @param {Object} cx The context object for a test run.
+ * @param {Object} defaults An object containing name/value pairs to set on
+ *     this test suite instance.  The value listed here will be used if the
+ *     name is not defined on the context object.
+ */
+lib.TestManager.Suite.prototype.setDefaults = function(cx, defaults) {
+  for (var k in defaults) {
+    this[k] = (k in cx) ? cx[k] : defaults[k];
+  }
+};
+
+/**
+ * Subclassable method called to set up the test suite.
+ *
+ * The default implementation of this method is a no-op.  If your test suite
+ * requires some kind of suite-wide setup, this is the place to do it.
+ *
+ * It's fine to store state on the test suite instance, that state will be
+ * accessible to all tests in the suite.  If any test case fails, the entire
+ * test suite object will be discarded and a new one will be created for
+ * the remaining tests.
+ *
+ * Any side effects outside of this test suite instance must be idempotent.
+ * For example, if you're adding DOM nodes to a document, make sure to first
+ * test that they're not already there.  If they are, remove them rather than
+ * reuse them.  You should not count on their state, since they were probably
+ * left behind by a failed testcase.
+ *
+ * Any exception here will abort the remainder of the test run.
+ *
+ * @param {Object} cx The context object for a test run.
+ */
+lib.TestManager.Suite.prototype.setup = function(cx) {};
+
+/**
+ * Subclassable method called to do pre-test set up.
+ *
+ * The default implementation of this method is a no-op.  If your test suite
+ * requires some kind of pre-test setup, this is the place to do it.
+ *
+ * This can be used to avoid a bunch of boilerplate setup/teardown code in
+ * this suite's testcases.
+ *
+ * Any exception here will abort the remainder of the test run.
+ *
+ * @param {lib.TestManager.Result} result The result object for the upcoming
+ *     test.
+ * @param {Object} cx The context object for a test run.
+ */
+lib.TestManager.Suite.prototype.preamble = function(result, cx) {};
+
+/**
+ * Subclassable method called to do post-test tear-down.
+ *
+ * The default implementation of this method is a no-op.  If your test suite
+ * requires some kind of pre-test setup, this is the place to do it.
+ *
+ * This can be used to avoid a bunch of boilerplate setup/teardown code in
+ * this suite's testcases.
+ *
+ * Any exception here will abort the remainder of the test run.
+ *
+ * @param {lib.TestManager.Result} result The result object for the upcoming
+ *     test.
+ * @param {Object} cx The context object for a test run.
+ */
+lib.TestManager.Suite.prototype.postamble = function(result, cx) {};
+
+/**
+ * Object representing a single test in a test suite.
+ *
+ * These are created as part of the lib.TestManager.Suite.addTest() method.
+ * You should never have to construct one by hand.
+ *
+ * @param {lib.TestManager.Suite} suiteClass The test suite class containing
+ *     this test.
+ * @param {string} testName The local name of this test case, not including the
+ *     test suite name.
+ * @param {function(lib.TestManager.Result, Object)} testFunction The function
+ *     to invoke for this test case.  This is passed a Result instance and the
+ *     context object associated with the test run.
+ *
+ */
+lib.TestManager.Test = function(suiteClass, testName, testFunction) {
+  /**
+   * The test suite class containing this function.
+   */
+  this.suiteClass = suiteClass;
+
+  /**
+   * The local name of this test, not including the test suite name.
+   */
+  this.testName = testName;
+
+  /**
+   * The global name of this test, including the test suite name.
+   */
+  this.fullName = suiteClass.suiteName + '[' + testName + ']';
+
+  // The function to call for this test.
+  this.testFunction_ = testFunction;
+};
+
+/**
+ * Execute this test.
+ *
+ * This is called by a lib.TestManager.Result instance, as part of a
+ * lib.TestManager.TestRun.  You should not call it by hand.
+ *
+ * @param {lib.TestManager.Result} result The result object for the test.
+ */
+lib.TestManager.Test.prototype.run = function(result) {
+  try {
+    // Tests are applied to the parent lib.TestManager.Suite subclass.
+    this.testFunction_.apply(result.suite,
+                             [result, result.testRun.cx]);
+  } catch (ex) {
+    if (ex instanceof lib.TestManager.Result.TestComplete)
+      return;
+
+    result.println('Test raised an exception: ' + ex);
+
+    if (ex.stack) {
+      if (ex.stack instanceof Array) {
+        result.println(ex.stack.join('\n'));
+      } else {
+        result.println(ex.stack);
+      }
+    }
+
+    result.completeTest_(result.FAILED, false);
+  }
+};
+
+/**
+ * Used to choose a set of tests and run them.
+ *
+ * It's slightly more convenient to construct one of these from
+ * lib.TestManager.prototype.createTestRun().
+ *
+ * @param {lib.TestManager} testManager The testManager associated with this
+ *     TestRun.
+ * @param {Object} cx A context to be passed into the tests.  This can be used
+ *     to set parameters for the test suite or individual test cases.
+ */
+lib.TestManager.TestRun = function(testManager, cx) {
+  /**
+   * The associated lib.TestManager instance.
+   */
+  this.testManager = testManager;
+
+  /**
+   * Shortcut to the lib.TestManager's log.
+   */
+  this.log = testManager.log;
+
+  /**
+   * The test run context.  It's entirely up to the test suite and test cases
+   * how this is used.  It is opaque to lib.TestManager.* classes.
+   */
+  this.cx = cx || {};
+
+  /**
+   * The list of test cases that encountered failures.
+   */
+  this.failures = [];
+
+  /**
+   * The list of test cases that passed.
+   */
+  this.passes = [];
+
+  /**
+   * The time the test run started, or null if it hasn't been started yet.
+   */
+  this.startDate = null;
+
+  /**
+   * The time in milliseconds that the test run took to complete, or null if
+   * it hasn't completed yet.
+   */
+  this.duration = null;
+
+  /**
+   * The most recent result object, or null if the test run hasn't started
+   * yet.  In order to detect late failures, this is not cleared when the test
+   * completes.
+   */
+  this.currentResult = null;
+
+  /**
+   * Number of maximum failures.  The test run will stop when this number is
+   * reached.  If 0 or ommitted, the entire set of selected tests is run, even
+   * if some fail.
+   */
+  this.maxFailures = 0;
+
+  /**
+   * True if this test run ended early because of an unexpected condition.
+   */
+  this.panic = false;
+
+  // List of pending test cases.
+  this.testQueue_ = [];
+
+};
+
+/**
+ * This value can be passed to select() to indicate that all tests should
+ * be selected.
+ */
+lib.TestManager.TestRun.prototype.ALL_TESTS = new String('<all-tests>');
+
+/**
+ * Add a single test to the test run.
+ */
+lib.TestManager.TestRun.prototype.selectTest = function(test) {
+  this.testQueue_.push(test);
+};
+
+lib.TestManager.TestRun.prototype.selectSuite = function(
+    suiteClass, opt_pattern) {
+  var pattern = opt_pattern || this.ALL_TESTS;
+  var selectCount = 0;
+  var testList = suiteClass.getTestList();
+
+  for (var j = 0; j < testList.length; j++) {
+    var test = testList[j];
+    // Note that we're using "!==" rather than "!=" so that we're matching
+    // the ALL_TESTS String object, rather than the contents of the string.
+    if (pattern !== this.ALL_TESTS) {
+      if (pattern instanceof RegExp) {
+        if (!pattern.test(test.testName))
+          continue;
+      } else if (test.testName != pattern) {
+        continue;
+      }
+    }
+
+    this.selectTest(test);
+    selectCount++;
+  }
+
+  return selectCount;
+};
+
+/**
+ * Selects one or more tests to gather results for.
+ *
+ * Selecting the same test more than once is allowed.
+ *
+ * @param {string|RegExp} pattern Pattern used to select tests.
+ *     If TestRun.prototype.ALL_TESTS, all tests are selected.
+ *     If a string, only the test that exactly matches is selected.
+ *     If a RegExp, only tests matching the RegExp are added.
+ *
+ * @return {int} The number of additional tests that have been selected into
+ *     this TestRun.
+ */
+lib.TestManager.TestRun.prototype.selectPattern = function(pattern) {
+  var selectCount = 0;
+
+  for (var i = 0; i < lib.TestManager.Suite.subclasses.length; i++) {
+    selectCount += this.selectSuite(lib.TestManager.Suite.subclasses[i],
+                                    pattern);
+  }
+
+  if (!selectCount) {
+    this.log.println('No tests matched selection criteria: ' + pattern);
+  }
+
+  return selectCount;
+};
+
+/**
+ * Hooked up to window.onerror during a test run in order to catch exceptions
+ * that would otherwise go uncaught.
+ */
+lib.TestManager.TestRun.prototype.onUncaughtException_ = function(
+    message, file, line) {
+
+  if (message.indexOf('Uncaught lib.TestManager.Result.TestComplete') == 0 ||
+      message.indexOf('status: passed') != -1) {
+    // This is a result.pass() or result.fail() call from a callback.  We're
+    // already going to deal with it as part of the completeTest_() call
+    // that raised it.  We can safely squelch this error message.
+    return true;
+  }
+
+  if (!this.currentResult)
+    return;
+
+  if (message == 'Uncaught ' + this.currentResult.expectedErrorMessage_) {
+    // Test cases may need to raise an unhandled exception as part of the test.
+    return;
+  }
+
+  var when = 'during';
+
+  if (this.currentResult.status != this.currentResult.PENDING)
+    when = 'after';
+
+  this.log.println('Uncaught exception ' + when + ' test case: ' +
+                   this.currentResult.test.fullName);
+  this.log.println(message + ', ' + file + ':' + line);
+
+  this.currentResult.completeTest_(this.currentResult.FAILED, false);
+
+  return false;
+};
+
+/**
+ * Called to when this test run has completed.
+ *
+ * This method typically re-runs itself asynchronously, in order to let the
+ * DOM stabilize and short-term timeouts to complete before declaring the
+ * test run complete.
+ *
+ * @param {boolean} opt_skipTimeout If true, the timeout is skipped and the
+ *     test run is completed immediately.  This should only be used from within
+ *     this function.
+ */
+lib.TestManager.TestRun.prototype.onTestRunComplete_ = function(
+    opt_skipTimeout) {
+  if (!opt_skipTimeout) {
+    // The final test may have left a lingering setTimeout(..., 0), or maybe
+    // poked at the DOM in a way that will trigger a event to fire at the end
+    // of this stack, so we give things a chance to settle down before our
+    // final cleanup...
+    setTimeout(this.onTestRunComplete_.bind(this), 0, true);
+    return;
+  }
+
+  this.duration = (new Date()) - this.startDate;
+
+  this.log.popPrefix();
+  this.log.println('} ' + this.passes.length + ' passed, ' +
+                   this.failures.length + ' failed, '  +
+                   this.msToSeconds_(this.duration));
+  this.log.println('');
+
+  this.summarize();
+
+  window.onerror = null;
+
+  this.testManager.onTestRunComplete(this);
+};
+
+/**
+ * Called by the lib.TestManager.Result object when a test completes.
+ *
+ * @param {lib.TestManager.Result} result The result object which has just
+ *     completed.
+ */
+lib.TestManager.TestRun.prototype.onResultComplete = function(result) {
+  try {
+    result.suite.postamble();
+  } catch (ex) {
+    this.log.println('Unexpected exception in postamble: ' +
+                     (ex.stack ? ex.stack : ex));
+    this.panic = true;
+  }
+
+  this.log.popPrefix();
+  this.log.print('} ' + result.status + ', ' +
+                 this.msToSeconds_(result.duration));
+  this.log.flush();
+
+  if (result.status == result.FAILED) {
+    this.failures.push(result);
+    this.currentSuite = null;
+  } else if (result.status == result.PASSED) {
+    this.passes.push(result);
+  } else {
+    this.log.println('Unknown result status: ' + result.test.fullName + ': ' +
+                     result.status);
+    return this.panic = true;
+  }
+
+  this.runNextTest_();
+};
+
+/**
+ * Called by the lib.TestManager.Result object when a test which has already
+ * completed reports another completion.
+ *
+ * This is usually indicative of a buggy testcase.  It is probably reporting a
+ * result on exit and then again from an asynchronous callback.
+ *
+ * It may also be the case that the last act of the testcase causes a DOM change
+ * which triggers some event to run after the test returns.  If the event
+ * handler reports a failure or raises an uncaught exception, the test will
+ * fail even though it has already completed.
+ *
+ * In any case, re-completing a test ALWAYS moves it into the failure pile.
+ *
+ * @param {lib.TestManager.Result} result The result object which has just
+ *     completed.
+ * @param {string} lateStatus The status that the test attempted to record this
+ *     time around.
+ */
+lib.TestManager.TestRun.prototype.onResultReComplete = function(
+    result, lateStatus) {
+  this.log.println('Late complete for test: ' + result.test.fullName + ': ' +
+                   lateStatus);
+
+  // Consider any late completion a failure, even if it's a double-pass, since
+  // it's a misuse of the testing API.
+  var index = this.passes.indexOf(result);
+  if (index >= 0) {
+    this.passes.splice(index, 1);
+    this.failures.push(result);
+  }
+};
+
+/**
+ * Run the next test in the queue.
+ */
+lib.TestManager.TestRun.prototype.runNextTest_ = function() {
+  if (this.panic || !this.testQueue_.length)
+    return this.onTestRunComplete_();
+
+  if (this.maxFailures && this.failures.length >= this.maxFailures) {
+    this.log.println('Maximum failure count reached, aborting test run.');
+    return this.onTestRunComplete_();
+  }
+
+  // Peek at the top test first.  We remove it later just before it's about
+  // to run, so that we don't disturb the incomplete test count in the
+  // event that we fail before running it.
+  var test = this.testQueue_[0];
+  var suite = this.currentResult ? this.currentResult.suite : null;
+
+  try {
+    if (!suite || !(suite instanceof test.suiteClass)) {
+      this.log.println('Initializing suite: ' + test.suiteClass.suiteName);
+      suite = new test.suiteClass(this.testManager, this.cx);
+    }
+  } catch (ex) {
+    // If test suite setup fails we're not even going to try to run the tests.
+    this.log.println('Exception during setup: ' + (ex.stack ? ex.stack : ex));
+    this.panic = true;
+    this.onTestRunComplete_();
+    return;
+  }
+
+  try {
+    this.log.print('Test: ' + test.fullName + ' {');
+    this.log.pushPrefix('  ');
+
+    this.currentResult = new lib.TestManager.Result(this, suite, test);
+    suite.preamble(this.currentResult, this.cx);
+
+    this.testQueue_.shift();
+  } catch (ex) {
+    this.log.println('Unexpected exception during test preamble: ' +
+                     (ex.stack ? ex.stack : ex));
+    this.log.popPrefix();
+    this.log.println('}');
+
+    this.panic = true;
+    this.onTestRunComplete_();
+    return;
+  }
+
+  try {
+    this.currentResult.run();
+  } catch (ex) {
+    // Result.run() should catch test exceptions and turn them into failures.
+    // If we got here, it means there is trouble in the testing framework.
+    this.log.println('Unexpected exception during test run: ' +
+                     (ex.stack ? ex.stack : ex));
+    this.panic = true;
+  }
+};
+
+/**
+ * Run the selected list of tests.
+ *
+ * Some tests may need to run asynchronously, so you cannot assume the run is
+ * complete when this function returns.  Instead, pass in a function to be
+ * called back when the run has completed.
+ *
+ * This function will log the results of the test run as they happen into the
+ * log defined by the associated lib.TestManager.  By default this is
+ * console.log, which can be viewed in the JavaScript console of most browsers.
+ *
+ * The browser state is determined by the last test to run.  We intentionally
+ * don't do any cleanup so that you can inspect the state of a failed test, or
+ * leave the browser ready for manual testing.
+ *
+ * Any failures in lib.TestManager.* code or test suite setup or test case
+ * preamble will cause the test run to abort.
+ */
+lib.TestManager.TestRun.prototype.run = function() {
+  this.log.println('Running ' + this.testQueue_.length + ' test(s) {');
+  this.log.pushPrefix('  ');
+
+  window.onerror = this.onUncaughtException_.bind(this);
+  this.startDate = new Date();
+  this.runNextTest_();
+};
+
+/**
+ * Format milliseconds as fractional seconds.
+ */
+lib.TestManager.TestRun.prototype.msToSeconds_ = function(ms) {
+  var secs = (ms / 1000).toFixed(2);
+  return secs + 's';
+};
+
+/**
+ * Log the current result summary.
+ */
+lib.TestManager.TestRun.prototype.summarize = function() {
+  if (this.failures.length) {
+    for (var i = 0; i < this.failures.length; i++) {
+      this.log.println('FAILED: ' + this.failures[i].test.fullName);
+    }
+  }
+
+  if (this.testQueue_.length) {
+    this.log.println('Test run incomplete: ' + this.testQueue_.length +
+                     ' test(s) were not run.');
+  }
+};
+
+/**
+ * Record of the result of a single test.
+ *
+ * These are constructed during a test run, you shouldn't have to make one
+ * on your own.
+ *
+ * An instance of this class is passed in to each test function.  It can be
+ * used to add messages to the test log, to record a test pass/fail state, to
+ * test assertions, or to create exception-proof wrappers for callback
+ * functions.
+ *
+ * @param {lib.TestManager.TestRun} testRun The TestRun instance associated with
+ *     this result.
+ * @param {lib.TestManager.Suit} suite The Suite containing the test we're
+ *     collecting this result for.
+ * @param {lib.TestManager.Test} test The test we're collecting this result for.
+ */
+lib.TestManager.Result = function(testRun, suite, test) {
+  /**
+   * The TestRun instance associated with this result.
+   */
+  this.testRun = testRun;
+
+  /**
+   * The Suite containing the test we're collecting this result for.
+   */
+  this.suite = suite;
+
+  /**
+   * The test we're collecting this result for.
+   */
+  this.test = test;
+
+  /**
+   * The time we started to collect this result, or null if we haven't started.
+   */
+  this.startDate = null;
+
+  /**
+   * The time in milliseconds that the test took to complete, or null if
+   * it hasn't completed yet.
+   */
+  this.duration = null;
+
+  /**
+   * The current status of this test result.
+   */
+  this.status = this.PENDING;
+
+  // An error message that the test case is expected to generate.
+  this.expectedErrorMessage_ = null;
+};
+
+/**
+ * Possible values for this.status.
+ */
+lib.TestManager.Result.prototype.PENDING = 'pending';
+lib.TestManager.Result.prototype.FAILED  = 'FAILED';
+lib.TestManager.Result.prototype.PASSED  = 'passed';
+
+/**
+ * Exception thrown when a test completes (pass or fail), to ensure no more of
+ * the test is run.
+ */
+lib.TestManager.Result.TestComplete = function(result) {
+  this.result = result;
+};
+
+lib.TestManager.Result.TestComplete.prototype.toString = function() {
+  return 'lib.TestManager.Result.TestComplete: ' + this.result.test.fullName +
+      ', status: ' + this.result.status;
+}
+
+/**
+ * Start the test associated with this result.
+ */
+lib.TestManager.Result.prototype.run = function() {
+  var self = this;
+
+  this.startDate = new Date();
+  this.test.run(this);
+
+  if (this.status == this.PENDING && !this.timeout_) {
+    this.println('Test did not return a value and did not request more time.');
+    this.completeTest_(this.FAILED, false);
+  }
+};
+
+/**
+ * Unhandled error message this test expects to generate.
+ *
+ * This must be the exact string that would appear in the JavaScript console,
+ * minus the 'Uncaught ' prefix.
+ *
+ * The test case does *not* automatically fail if the error message is not
+ * encountered.
+ */
+lib.TestManager.Result.prototype.expectErrorMessage = function(str) {
+  this.expectedErrorMessage_ = str;
+};
+
+/**
+ * Function called when a test times out.
+ */
+lib.TestManager.Result.prototype.onTimeout_ = function() {
+  this.timeout_ = null;
+
+  if (this.status != this.PENDING)
+    return;
+
+  this.println('Test timed out.');
+  this.completeTest_(this.FAILED, false);
+};
+
+/**
+ * Indicate that a test case needs more time to complete.
+ *
+ * Before a test case returns it must report a pass/fail result, or request more
+ * time to do so.
+ *
+ * If a test does not report pass/fail before the time expires it will
+ * be reported as a timeout failure.  Any late pass/fails will be noted in the
+ * test log, but will not affect the final result of the test.
+ *
+ * Test cases may call requestTime more than once.  If you have a few layers
+ * of asynchronous API to go through, you should call this once per layer with
+ * an estimate of how long each callback will take to complete.
+ *
+ * @param {int} ms Number of milliseconds requested.
+ */
+lib.TestManager.Result.prototype.requestTime = function(ms) {
+  if (this.timeout_)
+    clearTimeout(this.timeout_);
+
+  this.timeout_ = setTimeout(this.onTimeout_.bind(this), ms);
+};
+
+/**
+ * Report the completion of a test.
+ *
+ * @param {string} status The status of the test case.
+ * @param {boolean} opt_throw Optional boolean indicating whether or not
+ *     to throw the TestComplete exception.
+ */
+lib.TestManager.Result.prototype.completeTest_ = function(status, opt_throw) {
+  if (this.status == this.PENDING) {
+    this.duration = (new Date()) - this.startDate;
+    this.status = status;
+
+    this.testRun.onResultComplete(this);
+  } else {
+    this.testRun.onResultReComplete(this, status);
+  }
+
+  if (arguments.length < 2 || opt_throw)
+    throw new lib.TestManager.Result.TestComplete(this);
+};
+
+/**
+ * Assert that an actual value is exactly equal to the expected value.
+ *
+ * This uses the JavaScript '===' operator in order to avoid type coercion.
+ *
+ * If the assertion fails, the test is marked as a failure and a TestCompleted
+ * exception is thrown.
+ *
+ * @param {*} actual The actual measured value.
+ * @param {*} expected The value expected.
+ * @param {string} opt_name An optional name used to identify this
+ *     assertion in the test log.  If ommitted it will be the file:line
+ *     of the caller.
+ */
+lib.TestManager.Result.prototype.assertEQ = function(
+    actual, expected, opt_name) {
+  // Utility function to pretty up the log.
+  function format(value) {
+    if (typeof value == 'number')
+      return value;
+
+    var str = String(value);
+    var ary = str.split('\n').map(function (e) { return JSON.stringify(e) });
+    if (ary.length > 1) {
+      // If the string has newlines, start it off on its own line so that
+      // it's easier to compare against another string with newlines.
+      return '\n' + ary.join('\n');
+    } else {
+      return ary.join('\n');
+    }
+  }
+
+  if (actual === expected)
+    return;
+
+  var name = opt_name ? '[' + opt_name + ']' : '';
+
+  this.fail('assertEQ' + name + ': ' + this.getCallerLocation_(1) + ': ' +
+            format(actual) + ' !== ' + format(expected));
+};
+
+/**
+ * Assert that a value is true.
+ *
+ * This uses the JavaScript '===' operator in order to avoid type coercion.
+ * The must be the boolean value `true`, not just some "truish" value.
+ *
+ * If the assertion fails, the test is marked as a failure and a TestCompleted
+ * exception is thrown.
+ *
+ * @param {boolean} actual The actual measured value.
+ * @param {string} opt_name An optional name used to identify this
+ *     assertion in the test log.  If ommitted it will be the file:line
+ *     of the caller.
+ */
+lib.TestManager.Result.prototype.assert = function(actual, opt_name) {
+  if (actual === true)
+    return;
+
+  var name = opt_name ? '[' + opt_name + ']' : '';
+
+  this.fail('assert' + name + ': ' + this.getCallerLocation_(1) + ': ' +
+            String(actual));
+};
+
+/**
+ * Return the filename:line of a calling stack frame.
+ *
+ * This uses a dirty hack.  It throws an exception, catches it, and examines
+ * the stack property of the caught exception.
+ *
+ * @param {int} frameIndex The stack frame to return.  0 is the frame that
+ *     called this method, 1 is its caller, and so on.
+ * @return {string} A string of the format "filename:linenumber".
+ */
+lib.TestManager.Result.prototype.getCallerLocation_ = function(frameIndex) {
+  try {
+    throw new Error();
+  } catch (ex) {
+    var frame = ex.stack.split('\n')[frameIndex + 2];
+    var ary = frame.match(/([^/]+:\d+):\d+\)?$/);
+    return ary ? ary[1] : '???';
+  }
+};
+
+/**
+ * Write a message to the result log.
+ */
+lib.TestManager.Result.prototype.println = function(message) {
+  this.testRun.log.println(message);
+};
+
+/**
+ * Mark a failed test and exit out of the rest of the test.
+ *
+ * This will throw a TestCompleted exception, causing the current test to stop.
+ *
+ * @param {string} opt_message Optional message to add to the log.
+ */
+lib.TestManager.Result.prototype.fail = function(opt_message) {
+  if (arguments.length)
+    this.println(opt_message);
+
+  this.completeTest_(this.FAILED, true);
+};
+
+/**
+ * Mark a passed test and exit out of the rest of the test.
+ *
+ * This will throw a TestCompleted exception, causing the current test to stop.
+ */
+lib.TestManager.Result.prototype.pass = function() {
+  this.completeTest_(this.PASSED, true);
+};
+// SOURCE FILE: libdot/js/lib_utf8.js
+// Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+'use strict';
+
+// TODO(davidben): When the string encoding API is implemented,
+// replace this with the native in-browser implementation.
+//
+// http://wiki.whatwg.org/wiki/StringEncoding
+// http://dvcs.w3.org/hg/encoding/raw-file/tip/Overview.html
+
+/**
+ * A stateful UTF-8 decoder.
+ */
+lib.UTF8Decoder = function() {
+  // The number of bytes left in the current sequence.
+  this.bytesLeft = 0;
+  // The in-progress code point being decoded, if bytesLeft > 0.
+  this.codePoint = 0;
+  // The lower bound on the final code point, if bytesLeft > 0.
+  this.lowerBound = 0;
+};
+
+/**
+ * Decodes a some UTF-8 data, taking into account state from previous
+ * data streamed through the encoder.
+ *
+ * @param {String} str data to decode, represented as a JavaScript
+ *     String with each code unit representing a byte between 0x00 to
+ *     0xFF.
+ * @return {String} The data decoded into a JavaScript UTF-16 string.
+ */
+lib.UTF8Decoder.prototype.decode = function(str) {
+  var ret = '';
+  for (var i = 0; i < str.length; i++) {
+    var c = str.charCodeAt(i);
+    if (this.bytesLeft == 0) {
+      if (c <= 0x7F) {
+        ret += str.charAt(i);
+      } else if (0xC0 <= c && c <= 0xDF) {
+        this.codePoint = c - 0xC0;
+        this.bytesLeft = 1;
+        this.lowerBound = 0x80;
+      } else if (0xE0 <= c && c <= 0xEF) {
+        this.codePoint = c - 0xE0;
+        this.bytesLeft = 2;
+        this.lowerBound = 0x800;
+      } else if (0xF0 <= c && c <= 0xF7) {
+        this.codePoint = c - 0xF0;
+        this.bytesLeft = 3;
+        this.lowerBound = 0x10000;
+      } else if (0xF8 <= c && c <= 0xFB) {
+        this.codePoint = c - 0xF8;
+        this.bytesLeft = 4;
+        this.lowerBound = 0x200000;
+      } else if (0xFC <= c && c <= 0xFD) {
+        this.codePoint = c - 0xFC;
+        this.bytesLeft = 5;
+        this.lowerBound = 0x4000000;
+      } else {
+        ret += '\ufffd';
+      }
+    } else {
+      if (0x80 <= c && c <= 0xBF) {
+        this.bytesLeft--;
+        this.codePoint = (this.codePoint << 6) + (c - 0x80);
+        if (this.bytesLeft == 0) {
+          // Got a full sequence. Check if it's within bounds and
+          // filter out surrogate pairs.
+          var codePoint = this.codePoint;
+          if (codePoint < this.lowerBound
+              || (0xD800 <= codePoint && codePoint <= 0xDFFF)
+              || codePoint > 0x10FFFF) {
+            ret += '\ufffd';
+          } else {
+            // Encode as UTF-16 in the output.
+            if (codePoint < 0x10000) {
+              ret += String.fromCharCode(codePoint);
+            } else {
+              // Surrogate pair.
+              codePoint -= 0x10000;
+              ret += String.fromCharCode(
+                0xD800 + ((codePoint >>> 10) & 0x3FF),
+                0xDC00 + (codePoint & 0x3FF));
+            }
+          }
+        }
+      } else {
+        // Too few bytes in multi-byte sequence. Rewind stream so we
+        // don't lose the next byte.
+        ret += '\ufffd';
+        this.bytesLeft = 0;
+        i--;
+      }
+    }
+  }
+  return ret;
+};
+
+/**
+ * Decodes UTF-8 data. This is a convenience function for when all the
+ * data is already known.
+ *
+ * @param {String} str data to decode, represented as a JavaScript
+ *     String with each code unit representing a byte between 0x00 to
+ *     0xFF.
+ * @return {String} The data decoded into a JavaScript UTF-16 string.
+ */
+lib.decodeUTF8 = function(utf8) {
+  return (new lib.UTF8Decoder()).decode(utf8);
+};
+
+/**
+ * Encodes a UTF-16 string into UTF-8.
+ *
+ * TODO(davidben): Do we need a stateful version of this that can
+ * handle a surrogate pair split in two calls? What happens if a
+ * keypress event would have contained a character outside the BMP?
+ *
+ * @param {String} str The string to encode.
+ * @return {String} The string encoded as UTF-8, as a JavaScript
+ *     string with bytes represented as code units from 0x00 to 0xFF.
+ */
+lib.encodeUTF8 = function(str) {
+  var ret = '';
+  for (var i = 0; i < str.length; i++) {
+    // Get a unicode code point out of str.
+    var c = str.charCodeAt(i);
+    if (0xDC00 <= c && c <= 0xDFFF) {
+      c = 0xFFFD;
+    } else if (0xD800 <= c && c <= 0xDBFF) {
+      if (i+1 < str.length) {
+        var d = str.charCodeAt(i+1);
+        if (0xDC00 <= d && d <= 0xDFFF) {
+          // Swallow a surrogate pair.
+          c = 0x10000 + ((c & 0x3FF) << 10) + (d & 0x3FF);
+          i++;
+        } else {
+          c = 0xFFFD;
+        }
+      } else {
+        c = 0xFFFD;
+      }
+    }
+
+    // Encode c in UTF-8.
+    var bytesLeft;
+    if (c <= 0x7F) {
+      ret += str.charAt(i);
+      continue;
+    } else if (c <= 0x7FF) {
+      ret += String.fromCharCode(0xC0 | (c >>> 6));
+      bytesLeft = 1;
+    } else if (c <= 0xFFFF) {
+      ret += String.fromCharCode(0xE0 | (c >>> 12));
+      bytesLeft = 2;
+    } else /* if (c <= 0x10FFFF) */ {
+      ret += String.fromCharCode(0xF0 | (c >>> 18));
+      bytesLeft = 3;
+    }
+
+    while (bytesLeft > 0) {
+      bytesLeft--;
+      ret += String.fromCharCode(0x80 | ((c >>> (6 * bytesLeft)) & 0x3F));
+    }
+  }
+  return ret;
+};
+// SOURCE FILE: libdot/js/lib_wc.js
+// Copyright (c) 2014 The Chromium OS Authors. All rights reserved.
+// Use of lib.wc source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+'use strict';
+
+/**
+ * This JavaScript library is ported from the wcwidth.js module of node.js.
+ * The original implementation can be found at:
+ * https://npmjs.org/package/wcwidth.js
+ */
+
+/**
+ * JavaScript porting of Markus Kuhn's wcwidth() implementation
+ *
+ * The following explanation comes from the original C implementation:
+ *
+ * This is an implementation of wcwidth() and wcswidth() (defined in
+ * IEEE Std 1002.1-2001) for Unicode.
+ *
+ * http://www.opengroup.org/onlinepubs/007904975/functions/wcwidth.html
+ * http://www.opengroup.org/onlinepubs/007904975/functions/wcswidth.html
+ *
+ * In fixed-width output devices, Latin characters all occupy a single
+ * "cell" position of equal width, whereas ideographic CJK characters
+ * occupy two such cells. Interoperability between terminal-line
+ * applications and (teletype-style) character terminals using the
+ * UTF-8 encoding requires agreement on which character should advance
+ * the cursor by how many cell positions. No established formal
+ * standards exist at present on which Unicode character shall occupy
+ * how many cell positions on character terminals. These routines are
+ * a first attempt of defining such behavior based on simple rules
+ * applied to data provided by the Unicode Consortium.
+ *
+ * For some graphical characters, the Unicode standard explicitly
+ * defines a character-cell width via the definition of the East Asian
+ * FullWidth (F), Wide (W), Half-width (H), and Narrow (Na) classes.
+ * In all these cases, there is no ambiguity about which width a
+ * terminal shall use. For characters in the East Asian Ambiguous (A)
+ * class, the width choice depends purely on a preference of backward
+ * compatibility with either historic CJK or Western practice.
+ * Choosing single-width for these characters is easy to justify as
+ * the appropriate long-term solution, as the CJK practice of
+ * displaying these characters as double-width comes from historic
+ * implementation simplicity (8-bit encoded characters were displayed
+ * single-width and 16-bit ones double-width, even for Greek,
+ * Cyrillic, etc.) and not any typographic considerations.
+ *
+ * Much less clear is the choice of width for the Not East Asian
+ * (Neutral) class. Existing practice does not dictate a width for any
+ * of these characters. It would nevertheless make sense
+ * typographically to allocate two character cells to characters such
+ * as for instance EM SPACE or VOLUME INTEGRAL, which cannot be
+ * represented adequately with a single-width glyph. The following
+ * routines at present merely assign a single-cell width to all
+ * neutral characters, in the interest of simplicity. This is not
+ * entirely satisfactory and should be reconsidered before
+ * establishing a formal standard in lib.wc area. At the moment, the
+ * decision which Not East Asian (Neutral) characters should be
+ * represented by double-width glyphs cannot yet be answered by
+ * applying a simple rule from the Unicode database content. Setting
+ * up a proper standard for the behavior of UTF-8 character terminals
+ * will require a careful analysis not only of each Unicode character,
+ * but also of each presentation form, something the author of these
+ * routines has avoided to do so far.
+ *
+ * http://www.unicode.org/unicode/reports/tr11/
+ *
+ * Markus Kuhn -- 2007-05-26 (Unicode 5.0)
+ *
+ * Permission to use, copy, modify, and distribute lib.wc software
+ * for any purpose and without fee is hereby granted. The author
+ * disclaims all warranties with regard to lib.wc software.
+ *
+ * Latest version: http://www.cl.cam.ac.uk/~mgk25/ucs/wcwidth.c
+ */
+
+/**
+ * The following function defines the column width of an ISO 10646 character
+ * as follows:
+ *
+ *  - The null character (U+0000) has a column width of 0.
+ *  - Other C0/C1 control characters and DEL will lead to a return value of -1.
+ *  - Non-spacing and enclosing combining characters (general category code Mn
+ *    or Me in the Unicode database) have a column width of 0.
+ *  - SOFT HYPHEN (U+00AD) has a column width of 1.
+ *  - Other format characters (general category code Cf in the Unicode database)
+ *    and ZERO WIDTH SPACE (U+200B) have a column width of 0.
+ *  - Hangul Jamo medial vowels and final consonants (U+1160-U+11FF) have a
+ *    column width of 0.
+ *  - Spacing characters in the East Asian Wide (W) or East Asian Full-width (F)
+ *    category as defined in Unicode Technical Report #11 have a column width of
+ *    2.
+ *  - East Asian Ambigous characters are taken into account if
+ *    regardCjkAmbiguous flag is enabled. They have a column width of 2.
+ *  - All remaining characters (including all printable ISO 8859-1 and WGL4
+ *    characters, Unicode control characters, etc.) have a column width of 1.
+ *
+ * This implementation assumes that characters are encoded in ISO 10646.
+ */
+
+lib.wc = {};
+
+// Width of a nul character.
+lib.wc.nulWidth = 0;
+
+// Width of a control charater.
+lib.wc.controlWidth = 0;
+
+// Flag whether to consider East Asian Ambiguous characters.
+lib.wc.regardCjkAmbiguous = false;
+
+// Width of an East Asian Ambiguous character.
+lib.wc.cjkAmbiguousWidth = 2;
+
+// Sorted list of non-overlapping intervals of non-spacing characters
+// generated by "uniset +cat=Me +cat=Mn +cat=Cf -00AD +1160-11FF +200B c"
+lib.wc.combining = [
+    [ 0x0300, 0x036F ], [ 0x0483, 0x0486 ], [ 0x0488, 0x0489 ],
+    [ 0x0591, 0x05BD ], [ 0x05BF, 0x05BF ], [ 0x05C1, 0x05C2 ],
+    [ 0x05C4, 0x05C5 ], [ 0x05C7, 0x05C7 ], [ 0x0600, 0x0603 ],
+    [ 0x0610, 0x0615 ], [ 0x064B, 0x065E ], [ 0x0670, 0x0670 ],
+    [ 0x06D6, 0x06E4 ], [ 0x06E7, 0x06E8 ], [ 0x06EA, 0x06ED ],
+    [ 0x070F, 0x070F ], [ 0x0711, 0x0711 ], [ 0x0730, 0x074A ],
+    [ 0x07A6, 0x07B0 ], [ 0x07EB, 0x07F3 ], [ 0x0901, 0x0902 ],
+    [ 0x093C, 0x093C ], [ 0x0941, 0x0948 ], [ 0x094D, 0x094D ],
+    [ 0x0951, 0x0954 ], [ 0x0962, 0x0963 ], [ 0x0981, 0x0981 ],
+    [ 0x09BC, 0x09BC ], [ 0x09C1, 0x09C4 ], [ 0x09CD, 0x09CD ],
+    [ 0x09E2, 0x09E3 ], [ 0x0A01, 0x0A02 ], [ 0x0A3C, 0x0A3C ],
+    [ 0x0A41, 0x0A42 ], [ 0x0A47, 0x0A48 ], [ 0x0A4B, 0x0A4D ],
+    [ 0x0A70, 0x0A71 ], [ 0x0A81, 0x0A82 ], [ 0x0ABC, 0x0ABC ],
+    [ 0x0AC1, 0x0AC5 ], [ 0x0AC7, 0x0AC8 ], [ 0x0ACD, 0x0ACD ],
+    [ 0x0AE2, 0x0AE3 ], [ 0x0B01, 0x0B01 ], [ 0x0B3C, 0x0B3C ],
+    [ 0x0B3F, 0x0B3F ], [ 0x0B41, 0x0B43 ], [ 0x0B4D, 0x0B4D ],
+    [ 0x0B56, 0x0B56 ], [ 0x0B82, 0x0B82 ], [ 0x0BC0, 0x0BC0 ],
+    [ 0x0BCD, 0x0BCD ], [ 0x0C3E, 0x0C40 ], [ 0x0C46, 0x0C48 ],
+    [ 0x0C4A, 0x0C4D ], [ 0x0C55, 0x0C56 ], [ 0x0CBC, 0x0CBC ],
+    [ 0x0CBF, 0x0CBF ], [ 0x0CC6, 0x0CC6 ], [ 0x0CCC, 0x0CCD ],
+    [ 0x0CE2, 0x0CE3 ], [ 0x0D41, 0x0D43 ], [ 0x0D4D, 0x0D4D ],
+    [ 0x0DCA, 0x0DCA ], [ 0x0DD2, 0x0DD4 ], [ 0x0DD6, 0x0DD6 ],
+    [ 0x0E31, 0x0E31 ], [ 0x0E34, 0x0E3A ], [ 0x0E47, 0x0E4E ],
+    [ 0x0EB1, 0x0EB1 ], [ 0x0EB4, 0x0EB9 ], [ 0x0EBB, 0x0EBC ],
+    [ 0x0EC8, 0x0ECD ], [ 0x0F18, 0x0F19 ], [ 0x0F35, 0x0F35 ],
+    [ 0x0F37, 0x0F37 ], [ 0x0F39, 0x0F39 ], [ 0x0F71, 0x0F7E ],
+    [ 0x0F80, 0x0F84 ], [ 0x0F86, 0x0F87 ], [ 0x0F90, 0x0F97 ],
+    [ 0x0F99, 0x0FBC ], [ 0x0FC6, 0x0FC6 ], [ 0x102D, 0x1030 ],
+    [ 0x1032, 0x1032 ], [ 0x1036, 0x1037 ], [ 0x1039, 0x1039 ],
+    [ 0x1058, 0x1059 ], [ 0x1160, 0x11FF ], [ 0x135F, 0x135F ],
+    [ 0x1712, 0x1714 ], [ 0x1732, 0x1734 ], [ 0x1752, 0x1753 ],
+    [ 0x1772, 0x1773 ], [ 0x17B4, 0x17B5 ], [ 0x17B7, 0x17BD ],
+    [ 0x17C6, 0x17C6 ], [ 0x17C9, 0x17D3 ], [ 0x17DD, 0x17DD ],
+    [ 0x180B, 0x180D ], [ 0x18A9, 0x18A9 ], [ 0x1920, 0x1922 ],
+    [ 0x1927, 0x1928 ], [ 0x1932, 0x1932 ], [ 0x1939, 0x193B ],
+    [ 0x1A17, 0x1A18 ], [ 0x1B00, 0x1B03 ], [ 0x1B34, 0x1B34 ],
+    [ 0x1B36, 0x1B3A ], [ 0x1B3C, 0x1B3C ], [ 0x1B42, 0x1B42 ],
+    [ 0x1B6B, 0x1B73 ], [ 0x1DC0, 0x1DCA ], [ 0x1DFE, 0x1DFF ],
+    [ 0x200B, 0x200F ], [ 0x202A, 0x202E ], [ 0x2060, 0x2063 ],
+    [ 0x206A, 0x206F ], [ 0x20D0, 0x20EF ], [ 0x302A, 0x302F ],
+    [ 0x3099, 0x309A ], [ 0xA806, 0xA806 ], [ 0xA80B, 0xA80B ],
+    [ 0xA825, 0xA826 ], [ 0xFB1E, 0xFB1E ], [ 0xFE00, 0xFE0F ],
+    [ 0xFE20, 0xFE23 ], [ 0xFEFF, 0xFEFF ], [ 0xFFF9, 0xFFFB ],
+    [ 0x10A01, 0x10A03 ], [ 0x10A05, 0x10A06 ], [ 0x10A0C, 0x10A0F ],
+    [ 0x10A38, 0x10A3A ], [ 0x10A3F, 0x10A3F ], [ 0x1D167, 0x1D169 ],
+    [ 0x1D173, 0x1D182 ], [ 0x1D185, 0x1D18B ], [ 0x1D1AA, 0x1D1AD ],
+    [ 0x1D242, 0x1D244 ], [ 0xE0001, 0xE0001 ], [ 0xE0020, 0xE007F ],
+    [ 0xE0100, 0xE01EF ]
+];
+
+// Sorted list of non-overlapping intervals of East Asian Ambiguous characters
+// generated by "uniset +WIDTH-A -cat=Me -cat=Mn -cat=Cf c"
+lib.wc.ambiguous = [
+    [ 0x00A1, 0x00A1 ], [ 0x00A4, 0x00A4 ], [ 0x00A7, 0x00A8 ],
+    [ 0x00AA, 0x00AA ], [ 0x00AE, 0x00AE ], [ 0x00B0, 0x00B4 ],
+    [ 0x00B6, 0x00BA ], [ 0x00BC, 0x00BF ], [ 0x00C6, 0x00C6 ],
+    [ 0x00D0, 0x00D0 ], [ 0x00D7, 0x00D8 ], [ 0x00DE, 0x00E1 ],
+    [ 0x00E6, 0x00E6 ], [ 0x00E8, 0x00EA ], [ 0x00EC, 0x00ED ],
+    [ 0x00F0, 0x00F0 ], [ 0x00F2, 0x00F3 ], [ 0x00F7, 0x00FA ],
+    [ 0x00FC, 0x00FC ], [ 0x00FE, 0x00FE ], [ 0x0101, 0x0101 ],
+    [ 0x0111, 0x0111 ], [ 0x0113, 0x0113 ], [ 0x011B, 0x011B ],
+    [ 0x0126, 0x0127 ], [ 0x012B, 0x012B ], [ 0x0131, 0x0133 ],
+    [ 0x0138, 0x0138 ], [ 0x013F, 0x0142 ], [ 0x0144, 0x0144 ],
+    [ 0x0148, 0x014B ], [ 0x014D, 0x014D ], [ 0x0152, 0x0153 ],
+    [ 0x0166, 0x0167 ], [ 0x016B, 0x016B ], [ 0x01CE, 0x01CE ],
+    [ 0x01D0, 0x01D0 ], [ 0x01D2, 0x01D2 ], [ 0x01D4, 0x01D4 ],
+    [ 0x01D6, 0x01D6 ], [ 0x01D8, 0x01D8 ], [ 0x01DA, 0x01DA ],
+    [ 0x01DC, 0x01DC ], [ 0x0251, 0x0251 ], [ 0x0261, 0x0261 ],
+    [ 0x02C4, 0x02C4 ], [ 0x02C7, 0x02C7 ], [ 0x02C9, 0x02CB ],
+    [ 0x02CD, 0x02CD ], [ 0x02D0, 0x02D0 ], [ 0x02D8, 0x02DB ],
+    [ 0x02DD, 0x02DD ], [ 0x02DF, 0x02DF ], [ 0x0391, 0x03A1 ],
+    [ 0x03A3, 0x03A9 ], [ 0x03B1, 0x03C1 ], [ 0x03C3, 0x03C9 ],
+    [ 0x0401, 0x0401 ], [ 0x0410, 0x044F ], [ 0x0451, 0x0451 ],
+    [ 0x2010, 0x2010 ], [ 0x2013, 0x2016 ], [ 0x2018, 0x2019 ],
+    [ 0x201C, 0x201D ], [ 0x2020, 0x2022 ], [ 0x2024, 0x2027 ],
+    [ 0x2030, 0x2030 ], [ 0x2032, 0x2033 ], [ 0x2035, 0x2035 ],
+    [ 0x203B, 0x203B ], [ 0x203E, 0x203E ], [ 0x2074, 0x2074 ],
+    [ 0x207F, 0x207F ], [ 0x2081, 0x2084 ], [ 0x20AC, 0x20AC ],
+    [ 0x2103, 0x2103 ], [ 0x2105, 0x2105 ], [ 0x2109, 0x2109 ],
+    [ 0x2113, 0x2113 ], [ 0x2116, 0x2116 ], [ 0x2121, 0x2122 ],
+    [ 0x2126, 0x2126 ], [ 0x212B, 0x212B ], [ 0x2153, 0x2154 ],
+    [ 0x215B, 0x215E ], [ 0x2160, 0x216B ], [ 0x2170, 0x2179 ],
+    [ 0x2190, 0x2199 ], [ 0x21B8, 0x21B9 ], [ 0x21D2, 0x21D2 ],
+    [ 0x21D4, 0x21D4 ], [ 0x21E7, 0x21E7 ], [ 0x2200, 0x2200 ],
+    [ 0x2202, 0x2203 ], [ 0x2207, 0x2208 ], [ 0x220B, 0x220B ],
+    [ 0x220F, 0x220F ], [ 0x2211, 0x2211 ], [ 0x2215, 0x2215 ],
+    [ 0x221A, 0x221A ], [ 0x221D, 0x2220 ], [ 0x2223, 0x2223 ],
+    [ 0x2225, 0x2225 ], [ 0x2227, 0x222C ], [ 0x222E, 0x222E ],
+    [ 0x2234, 0x2237 ], [ 0x223C, 0x223D ], [ 0x2248, 0x2248 ],
+    [ 0x224C, 0x224C ], [ 0x2252, 0x2252 ], [ 0x2260, 0x2261 ],
+    [ 0x2264, 0x2267 ], [ 0x226A, 0x226B ], [ 0x226E, 0x226F ],
+    [ 0x2282, 0x2283 ], [ 0x2286, 0x2287 ], [ 0x2295, 0x2295 ],
+    [ 0x2299, 0x2299 ], [ 0x22A5, 0x22A5 ], [ 0x22BF, 0x22BF ],
+    [ 0x2312, 0x2312 ], [ 0x2460, 0x24E9 ], [ 0x24EB, 0x254B ],
+    [ 0x2550, 0x2573 ], [ 0x2580, 0x258F ], [ 0x2592, 0x2595 ],
+    [ 0x25A0, 0x25A1 ], [ 0x25A3, 0x25A9 ], [ 0x25B2, 0x25B3 ],
+    [ 0x25B6, 0x25B7 ], [ 0x25BC, 0x25BD ], [ 0x25C0, 0x25C1 ],
+    [ 0x25C6, 0x25C8 ], [ 0x25CB, 0x25CB ], [ 0x25CE, 0x25D1 ],
+    [ 0x25E2, 0x25E5 ], [ 0x25EF, 0x25EF ], [ 0x2605, 0x2606 ],
+    [ 0x2609, 0x2609 ], [ 0x260E, 0x260F ], [ 0x2614, 0x2615 ],
+    [ 0x261C, 0x261C ], [ 0x261E, 0x261E ], [ 0x2640, 0x2640 ],
+    [ 0x2642, 0x2642 ], [ 0x2660, 0x2661 ], [ 0x2663, 0x2665 ],
+    [ 0x2667, 0x266A ], [ 0x266C, 0x266D ], [ 0x266F, 0x266F ],
+    [ 0x273D, 0x273D ], [ 0x2776, 0x277F ], [ 0xE000, 0xF8FF ],
+    [ 0xFFFD, 0xFFFD ], [ 0xF0000, 0xFFFFD ], [ 0x100000, 0x10FFFD ]
+];
+
+/**
+ * Binary search to check if the given unicode character is a space character.
+ *
+ * @param {interger} ucs A unicode character code.
+ *
+ * @return {boolean} True if the given character is a space character; false
+ *     otherwise.
+ */
+lib.wc.isSpace = function(ucs) {
+  // Auxiliary function for binary search in interval table.
+  var min = 0, max = lib.wc.combining.length - 1;
+  var mid;
+
+  if (ucs < lib.wc.combining[0][0] || ucs > lib.wc.combining[max][1])
+    return false;
+  while (max >= min) {
+    mid = Math.floor((min + max) / 2);
+    if (ucs > lib.wc.combining[mid][1]) {
+      min = mid + 1;
+    } else if (ucs < lib.wc.combining[mid][0]) {
+      max = mid - 1;
+    } else {
+      return true;
+    }
+  }
+
+  return false;
+};
+
+/**
+ * Auxiliary function for checking if the given unicode character is a East
+ * Asian Ambiguous character.
+ *
+ * @param {interger} ucs A unicode character code.
+ *
+ * @return {boolean} True if the given character is a East Asian Ambiguous
+ * character.
+ */
+lib.wc.isCjkAmbiguous = function(ucs) {
+  var min = 0, max = lib.wc.ambiguous.length - 1;
+  var mid;
+
+  if (ucs < lib.wc.ambiguous[0][0] || ucs > lib.wc.ambiguous[max][1])
+    return false;
+  while (max >= min) {
+    mid = Math.floor((min + max) / 2);
+    if (ucs > lib.wc.ambiguous[mid][1]) {
+      min = mid + 1;
+    } else if (ucs < lib.wc.ambiguous[mid][0]) {
+      max = mid - 1;
+    } else {
+      return true;
+    }
+  }
+
+  return false;
+};
+
+/**
+ * Determine the column width of the given character.
+ *
+ * @param {integer} ucs A unicode character code.
+ *
+ * @return {integer} The column width of the given character.
+ */
+lib.wc.charWidth = function(ucs) {
+  if (lib.wc.regardCjkAmbiguous) {
+    return lib.wc.charWidthRegardAmbiguous(ucs);
+  } else {
+    return lib.wc.charWidthDisregardAmbiguous(ucs);
+  }
+};
+
+/**
+ * Determine the column width of the given character without considering East
+ * Asian Ambiguous characters.
+ *
+ * @param {integer} ucs A unicode character code.
+ *
+ * @return {integer} The column width of the given character.
+ */
+lib.wc.charWidthDisregardAmbiguous = function(ucs) {
+  // Test for 8-bit control characters.
+  if (ucs === 0)
+    return lib.wc.nulWidth;
+  if (ucs < 32 || (ucs >= 0x7f && ucs < 0xa0))
+    return lib.wc.controlWidth;
+
+  // Optimize for ASCII characters.
+  if (ucs < 0x7f)
+    return 1;
+
+  // Binary search in table of non-spacing characters.
+  if (lib.wc.isSpace(ucs))
+    return 0;
+
+  // If we arrive here, ucs is not a combining or C0/C1 control character.
+  return 1 +
+    (ucs >= 0x1100 &&
+     (ucs <= 0x115f ||             // Hangul Jamo init. consonants
+      ucs == 0x2329 || ucs == 0x232a ||
+      (ucs >= 0x2e80 && ucs <= 0xa4cf &&
+       ucs != 0x303f) ||           // CJK ... Yi
+      (ucs >= 0xac00 && ucs <= 0xd7a3) ||  // Hangul Syllables
+      (ucs >= 0xf900 && ucs <= 0xfaff) ||  // CJK Compatibility Ideographs
+      (ucs >= 0xfe10 && ucs <= 0xfe19) ||  // Vertical forms
+      (ucs >= 0xfe30 && ucs <= 0xfe6f) ||  // CJK Compatibility Forms
+      (ucs >= 0xff00 && ucs <= 0xff60) ||  // Fullwidth Forms
+      (ucs >= 0xffe0 && ucs <= 0xffe6) ||
+      (ucs >= 0x20000 && ucs <= 0x2fffd) ||
+      (ucs >= 0x30000 && ucs <= 0x3fffd)));
+};
+
+/**
+ * Determine the column width of the given character considering East Asian
+ * Ambiguous characters.
+ *
+ * @param {integer} ucs A unicode character code.
+ *
+ * @return {integer} The column width of the given character.
+ */
+lib.wc.charWidthRegardAmbiguous = function(ucs) {
+  if (lib.wc.isCjkAmbiguous(ucs))
+    return lib.wc.cjkAmbiguousWidth;
+
+  return lib.wc.charWidthDisregardAmbiguous(ucs);
+};
+
+/**
+ * Determine the column width of the given string.
+ *
+ * @param {string} str A string.
+ *
+ * @return {integer} The column width of the given string.
+ */
+lib.wc.strWidth = function(str) {
+  var width, rv = 0;
+
+  for (var i = 0; i < str.length; i++) {
+    width = lib.wc.charWidth(str.charCodeAt(i));
+    if (width < 0)
+      return -1;
+    rv += width;
+  }
+
+  return rv;
+};
+
+/**
+ * Get the substring at the given column offset of the given column width.
+ *
+ * @param {string} str The string to get substring from.
+ * @param {integer} start The starting column offset to get substring.
+ * @param {integer} opt_width The column width of the substring.
+ *
+ * @return {string} The substring.
+ */
+lib.wc.substr = function(str, start, opt_width) {
+  var startIndex, endIndex, width;
+
+  for (startIndex = 0, width = 0; startIndex < str.length; startIndex++) {
+    width += lib.wc.charWidth(str.charCodeAt(startIndex));
+    if (width > start)
+      break;
+  }
+
+  if (opt_width != undefined) {
+    for (endIndex = startIndex, width = 0;
+         endIndex < str.length && width < opt_width;
+         width += lib.wc.charWidth(str.charCodeAt(endIndex)), endIndex++);
+    if (width > opt_width)
+      endIndex--;
+    return str.substring(startIndex, endIndex);
+  }
+
+  return str.substr(startIndex);
+};
+
+/**
+ * Get substring at the given start and end column offset.
+ *
+ * @param {string} str The string to get substring from.
+ * @param {integer} start The starting column offset.
+ * @param {integer} end The ending column offset.
+ *
+ * @return {string} The substring.
+ */
+lib.wc.substring = function(str, start, end) {
+  return lib.wc.substr(str, start, end - start);
+};
+lib.resource.add('libdot/changelog/version', 'text/plain',
+'1.9' +
+''
+);
+
+lib.resource.add('libdot/changelog/date', 'text/plain',
+'2014-05-27' +
+''
+);
+
 // SOURCE FILE: hterm/js/hterm.js
 // Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
@@ -26,7 +4875,7 @@
 
 'use strict';
 
-lib.rtdep('lib.fs', 'lib.Storage');
+lib.rtdep('lib.Storage');
 
 /**
  * @fileoverview Declares the hterm.* namespace and some basic shared utilities
@@ -60,6 +4909,14 @@ hterm.zoomWarningMessage = 'ZOOM != 100%';
  */
 hterm.notifyCopyMessage = '\u2702';
 
+
+/**
+ * Text shown in a desktop notification for the terminal
+ * bell.  \u226a is a unicode EIGHTH NOTE, %(title) will
+ * be replaced by the terminal title.
+ */
+hterm.desktopNotificationTitle = '\u266A %(title) \u266A';
+
 /**
  * List of known hterm test suites.
  *
@@ -84,7 +4941,7 @@ lib.registerInit('hterm', function(onInit) {
   }
 
   function onTab(tab) {
-    if (tab) {
+    if (tab && window.chrome) {
       chrome.windows.get(tab.windowId, null, onWindow);
     } else {
       // TODO(rginda): This is where we end up for a v1 app's background page.
@@ -96,8 +4953,9 @@ lib.registerInit('hterm', function(onInit) {
 
   if (!hterm.defaultStorage) {
     var ary = navigator.userAgent.match(/\sChrome\/(\d\d)/);
-    var version = parseInt(ary[1]);
-    if (chrome.storage && chrome.storage.sync && version > 21) {
+    var version = ary ? parseInt(ary[1]) : -1;
+    if (window.chrome && chrome.storage && chrome.storage.sync &&
+        version > 21) {
       hterm.defaultStorage = new lib.Storage.Chrome(chrome.storage.sync);
     } else {
       hterm.defaultStorage = new lib.Storage.Local();
@@ -107,7 +4965,7 @@ lib.registerInit('hterm', function(onInit) {
   // The chrome.tabs API is not supported in packaged apps, and detecting if
   // you're a packaged app is a little awkward.
   var isPackagedApp = false;
-  if (chrome && chrome.runtime && chrome.runtime.getManifest) {
+  if (window.chrome && chrome.runtime && chrome.runtime.getManifest) {
     var manifest = chrome.runtime.getManifest();
     var isPackagedApp = manifest.app && manifest.app.background;
   }
@@ -116,7 +4974,7 @@ lib.registerInit('hterm', function(onInit) {
     // Packaged apps are never displayed in browser tabs.
     setTimeout(onWindow.bind(null, {type: 'popup'}), 0);
   } else {
-    if (chrome && chrome.tabs) {
+    if (window.chrome && chrome.tabs) {
       // The getCurrent method gets the tab that is "currently running", not the
       // topmost or focused tab.
       chrome.tabs.getCurrent(onTab);
@@ -153,7 +5011,12 @@ hterm.getClientHeight = function(dom) {
  * @param {HTMLDocument} The document with the selection to copy.
  */
 hterm.copySelectionToClipboard = function(document) {
-  document.execCommand('copy');
+  try {
+    document.execCommand('copy');
+  } catch (firefoxException) {
+    // Ignore this. FF throws an exception if there was an error, even though
+    // the spec says just return false.
+  }
 };
 
 /**
@@ -162,7 +5025,12 @@ hterm.copySelectionToClipboard = function(document) {
  * @param {HTMLDocument} The document to paste into.
  */
 hterm.pasteFromClipboard = function(document) {
-  document.execCommand('paste');
+  try {
+    document.execCommand('paste');
+  } catch (firefoxException) {
+    // Ignore this. FF throws an exception if there was an error, even though
+    // the spec says just return false.
+  }
 };
 
 /**
@@ -560,6 +5428,14 @@ hterm.Keyboard = function(terminal) {
   this.keyMap = new hterm.Keyboard.KeyMap(this);
 
   /**
+   * none: Disable any AltGr related munging.
+   * ctrl-alt: Assume Ctrl+Alt means AltGr.
+   * left-alt: Assume left Alt means AltGr.
+   * right-alt: Assume right Alt means AltGr.
+   */
+  this.altGrMode = 'none';
+
+  /**
    * If true, Shift-Insert will fall through to the browser as a paste.
    * If false, the keystroke will be sent to the host.
    */
@@ -585,8 +5461,14 @@ hterm.Keyboard = function(terminal) {
   this.ctrlPlusMinusZeroZoom = true;
 
   /**
-   * If true, don't send Ctrl-V to the host, but instead paste the contents of
-   * the clipboard. In that case, send a ^V to the host on Ctrl-Shift-V.
+   * Ctrl+C copies if true, sends ^C to host if false.
+   * Ctrl+Shift+C sends ^C to host if true, copies if false.
+   */
+  this.ctrlCCopy = false;
+
+  /**
+   * Ctrl+V pastes if true, sends ^V to host if false.
+   * Ctrl+Shift+V sends ^V to host if true, pastes if false.
    */
   this.ctrlVPaste = false;
 
@@ -619,6 +5501,11 @@ hterm.Keyboard = function(terminal) {
    * Set whether the meta key sends a leading escape or not.
    */
   this.metaSendsEscape = true;
+
+  /**
+   * Set whether meta-V gets passed to host.
+   */
+  this.passMetaV = true;
 
   /**
    * Controls how the alt key is handled.
@@ -657,15 +5544,24 @@ hterm.Keyboard = function(terminal) {
 
   /**
    * Used to keep track of the current alt-key state, which is necessary for
-   * the altBackspaceIsMetaBackspace preference above.
+   * the altBackspaceIsMetaBackspace preference above and for the altGrMode
+   * preference.  This is a bitmap with where bit positions correspond to the
+   * "location" property of the key event.
    */
-  this.altIsPressed = false;
+  this.altKeyPressed = 0;
 
   /**
    * If true, Chrome OS media keys will be mapped to their F-key equivalent.
    * E.g. "Back" will be mapped to F1. If false, Chrome will handle the keys.
    */
   this.mediaKeysAreFKeys = false;
+
+  /**
+   * Holds the previous setting of altSendsWhat when DECSET 1039 is used. When
+   * DECRST 1039 is used, altSendsWhat is changed back to this and this is
+   * nulled out.
+   */
+  this.previousAltSendsWhat_ = null;
 };
 
 /**
@@ -789,6 +5685,14 @@ hterm.Keyboard.prototype.onTextInput_ = function(e) {
 hterm.Keyboard.prototype.onKeyPress_ = function(e) {
   var code;
 
+  var key = String.fromCharCode(e.which);
+  var lowerKey = key.toLowerCase();
+  if ((e.ctrlKey || e.metaKey) && (lowerKey == 'c' || lowerKey == 'v')) {
+    // On FF the key press (not key down) event gets fired for copy/paste.
+    // Let it fall through for the default browser behaviour.
+    return;
+  }
+
   if (e.altKey && this.altSendsWhat == 'browser-key' && e.charCode == 0) {
     // If we got here because we were expecting the browser to handle an
     // alt sequence but it didn't do it, then we might be on an OS without
@@ -813,13 +5717,30 @@ hterm.Keyboard.prototype.onKeyPress_ = function(e) {
   e.stopPropagation();
 };
 
+/**
+ * Prevent default handling for non-shifted event.
+ *
+ * When combined with Chrome permission 'app.window.fullscreen.overrideEsc',
+ * and called for both key down and key up events,
+ * the ESC key remains usable within fullscreen Chrome app windows.
+ */
+hterm.Keyboard.prototype.preventChromeAppNonShiftDefault_ = function(e) {
+  if (!window.chrome || !window.chrome.app || !window.chrome.app.window)
+    return;
+  if (!e.shiftKey)
+    e.preventDefault();
+};
+
 hterm.Keyboard.prototype.onBlur_ = function(e) {
-  this.altIsPressed = false;
+  this.altKeyPressed = 0;
 };
 
 hterm.Keyboard.prototype.onKeyUp_ = function(e) {
   if (e.keyCode == 18)
-    this.altIsPressed = false;
+    this.altKeyPressed = this.altKeyPressed & ~(1 << (e.location - 1));
+
+  if (e.keyCode == 27)
+    this.preventChromeAppNonShiftDefault_(e);
 };
 
 /**
@@ -827,7 +5748,10 @@ hterm.Keyboard.prototype.onKeyUp_ = function(e) {
  */
 hterm.Keyboard.prototype.onKeyDown_ = function(e) {
   if (e.keyCode == 18)
-    this.altIsPressed = true;
+    this.altKeyPressed = this.altKeyPressed | (1 << (e.location - 1));
+
+  if (e.keyCode == 27)
+    this.preventChromeAppNonShiftDefault_(e);
 
   var keyDef = this.keyMap.keyDefs[e.keyCode];
   if (!keyDef) {
@@ -868,6 +5792,34 @@ hterm.Keyboard.prototype.onKeyDown_ = function(e) {
   var alt = this.altIsMeta ? false : e.altKey;
   var meta = this.altIsMeta ? (e.altKey || e.metaKey) : e.metaKey;
 
+  // In the key-map, we surround the keyCap for non-printables in "[...]"
+  var isPrintable = !(/^\[\w+\]$/.test(keyDef.keyCap));
+
+  switch (this.altGrMode) {
+    case 'ctrl-alt':
+    if (isPrintable && control && alt) {
+      // ctrl-alt-printable means altGr.  We clear out the control and
+      // alt modifiers and wait to see the charCode in the keydown event.
+      control = false;
+      alt = false;
+    }
+    break;
+
+    case 'right-alt':
+    if (isPrintable && (this.terminal.keyboard.altKeyPressed & 2)) {
+      control = false;
+      alt = false;
+    }
+    break;
+
+    case 'left-alt':
+    if (isPrintable && (this.terminal.keyboard.altKeyPressed & 1)) {
+      control = false;
+      alt = false;
+    }
+    break;
+  }
+
   var action;
 
   if (control) {
@@ -879,10 +5831,6 @@ hterm.Keyboard.prototype.onKeyDown_ = function(e) {
   } else {
     action = getAction('normal');
   }
-
-  // The action may have cleared the e.shiftKey, so we wait until after
-  // getAction to read it.
-  var shift = e.shiftKey;
 
   if (alt && this.altSendsWhat == 'browser-key' && action == DEFAULT) {
     // When altSendsWhat is 'browser-key', we wait for the keypress event.
@@ -935,6 +5883,11 @@ hterm.Keyboard.prototype.onKeyDown_ = function(e) {
   } else if (resolvedActionType == 'meta') {
     meta = false;
   }
+
+  // Maybe strip the shift modifier too, for the same reason as above.
+  // This is only used for Ctrl-Shift-Tab, which should send "CSI Z", not
+  // "CSI 1 ; 2 Z".
+  var shift = !e.maskShiftKey && e.shiftKey;
 
   if (action.substr(0, 2) == '\x1b[' && (alt || control || shift)) {
     // The action is an escape sequence that and it was triggered in the
@@ -1113,7 +6066,7 @@ hterm.Keyboard.KeyMap.prototype.reset = function() {
 
   var self = this;
 
-  // This function us used by the "macro" functions below.  It makes it
+  // This function is used by the "macro" functions below.  It makes it
   // possible to use the call() macro as an argument to any other macro.
   function resolve(action, e, k) {
     if (typeof action == 'function')
@@ -1129,7 +6082,7 @@ hterm.Keyboard.KeyMap.prototype.reset = function() {
       var action = (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey ||
                     !self.keyboard.applicationKeypad) ? a : b;
       return resolve(action, e, k);
-    }
+    };
   }
 
   // If mod or not application cursor a, else b.  The keys that care about
@@ -1139,37 +6092,40 @@ hterm.Keyboard.KeyMap.prototype.reset = function() {
       var action = (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey ||
                     !self.keyboard.applicationCursor) ? a : b;
       return resolve(action, e, k);
-    }
+    };
   }
 
   // If not backspace-sends-backspace keypad a, else b.
   function bs(a, b) {
     return function(e, k) {
-      var action = !self.keyboard.backspaceSendsBackspace ? a : b
+      var action = !self.keyboard.backspaceSendsBackspace ? a : b;
       return resolve(action, e, k);
-    }
+    };
   }
 
   // If not e.shiftKey a, else b.
   function sh(a, b) {
     return function(e, k) {
-      var action = !e.shiftKey ? a : b
-
-      // Clear e.shiftKey so that the keyboard code doesn't try to apply
-      // additional modifiers to the sequence.
-      delete e.shiftKey;
-      e.shiftKey = false;
-
+      var action = !e.shiftKey ? a : b;
+      e.maskShiftKey = true;
       return resolve(action, e, k);
-    }
+    };
+  }
+
+  // If not e.altKey a, else b.
+  function alt(a, b) {
+    return function(e, k) {
+      var action = !e.altKey ? a : b;
+      return resolve(action, e, k);
+    };
   }
 
   // If no modifiers a, else b.
   function mod(a, b) {
-    return function (e, k) {
+    return function(e, k) {
       var action = !(e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) ? a : b;
       return resolve(action, e, k);
-    }
+    };
   }
 
   // Compute a control character for a given character.
@@ -1178,11 +6134,15 @@ hterm.Keyboard.KeyMap.prototype.reset = function() {
   // Call a method on the keymap instance.
   function c(m) { return function (e, k) { return this[m](e, k) } }
 
-  // Ignore if not trapping media keys
+  // Ignore if not trapping media keys.
   function med(fn) {
     return function(e, k) {
       if (!self.keyboard.mediaKeysAreFKeys) {
-        return hterm.Keyboard.KeyActions.PASS;
+        // Block Back, Forward, and Reload keys to avoid navigating away from
+        // the current page.
+        return (e.keyCode == 166 || e.keyCode == 167 || e.keyCode == 168) ?
+            hterm.Keyboard.KeyActions.CANCEL :
+            hterm.Keyboard.KeyActions.PASS;
       }
       return resolve(fn, e, k);
     };
@@ -1230,9 +6190,15 @@ hterm.Keyboard.KeyMap.prototype.reset = function() {
     [55,  '7&', DEFAULT, c('onCtrlNum_'),    c('onAltNum_'), c('onMetaNum_')],
     [56,  '8*', DEFAULT, c('onCtrlNum_'),    c('onAltNum_'), c('onMetaNum_')],
     [57,  '9(', DEFAULT, c('onCtrlNum_'),    c('onAltNum_'), c('onMetaNum_')],
-    [48,  '0)', DEFAULT, c('onPlusMinusZero_'),c('onAltNum_'),c('onMetaNum_')],
-    [189, '-_', DEFAULT, c('onPlusMinusZero_'),         DEFAULT,     DEFAULT],
-    [187, '=+', DEFAULT, c('onPlusMinusZero_'),         DEFAULT,     DEFAULT],
+    [48,  '0)', DEFAULT, c('onPlusMinusZero_'),c('onAltNum_'),c('onPlusMinusZero_')],
+    [189, '-_', DEFAULT, c('onPlusMinusZero_'), DEFAULT, c('onPlusMinusZero_')],
+    [187, '=+', DEFAULT, c('onPlusMinusZero_'), DEFAULT, c('onPlusMinusZero_')],
+    // Firefox -_ and =+
+    [173, '-_', DEFAULT, c('onPlusMinusZero_'), DEFAULT, c('onPlusMinusZero_')],
+    [61, '=+', DEFAULT, c('onPlusMinusZero_'), DEFAULT, c('onPlusMinusZero_')],
+    // Firefox Italian +*
+    [171, '+*', DEFAULT, c('onPlusMinusZero_'), DEFAULT, c('onPlusMinusZero_')],
+
     [8,   '[BKSP]', bs('\x7f', '\b'), bs('\b', '\x7f'), DEFAULT,     DEFAULT],
 
     // Third row.
@@ -1275,20 +6241,21 @@ hterm.Keyboard.KeyMap.prototype.reset = function() {
     [90,  'zZ',   DEFAULT, ctl('Z'),               DEFAULT, DEFAULT],
     [88,  'xX',   DEFAULT, ctl('X'),               DEFAULT, DEFAULT],
     [67,  'cC',   DEFAULT, c('onCtrlC_'),          DEFAULT, c('onMetaC_')],
-    [86,  'vV',   DEFAULT, c('onCtrlV_'),          DEFAULT, PASS],
+    [86,  'vV',   DEFAULT, c('onCtrlV_'),          DEFAULT, c('onMetaV_')],
     [66,  'bB',   DEFAULT, sh(ctl('B'), PASS),     DEFAULT, sh(DEFAULT, PASS)],
     [78,  'nN',   DEFAULT, c('onCtrlN_'),          DEFAULT, c('onMetaN_')],
     [77,  'mM',   DEFAULT, ctl('M'),               DEFAULT, DEFAULT],
-    [188, ',<',   DEFAULT, STRIP,                  DEFAULT, DEFAULT],
-    [190, '.>',   DEFAULT, STRIP,                  DEFAULT, DEFAULT],
+    [188, ',<',   DEFAULT, alt(STRIP, PASS),       DEFAULT, DEFAULT],
+    [190, '.>',   DEFAULT, alt(STRIP, PASS),       DEFAULT, DEFAULT],
     [191, '/?',   DEFAULT, sh(ctl('_'), ctl('?')), DEFAULT, DEFAULT],
 
     // Sixth and final row.
-    [17,  '[CTRL]', PASS,    PASS,     PASS,    PASS],
-    [18,  '[ALT]',  PASS,    PASS,     PASS,    PASS],
-    [91,  '[LAPL]', PASS,    PASS,     PASS,    PASS],
-    [32,  ' ',      DEFAULT, ctl('@'), DEFAULT, DEFAULT],
-    [92,  '[RAPL]', PASS,    PASS,     PASS,    PASS],
+    [17,  '[CTRL]',  PASS,    PASS,     PASS,    PASS],
+    [18,  '[ALT]',   PASS,    PASS,     PASS,    PASS],
+    [91,  '[LAPL]',  PASS,    PASS,     PASS,    PASS],
+    [32,  ' ',       DEFAULT, ctl('@'), DEFAULT, DEFAULT],
+    [92,  '[RAPL]',  PASS,    PASS,     PASS,    PASS],
+    [93,  '[RMENU]', PASS,    PASS,     PASS,    PASS],
 
     // These things.
     [42,  '[PRTSCR]', PASS, PASS, PASS, PASS],
@@ -1339,10 +6306,11 @@ hterm.Keyboard.KeyMap.prototype.reset = function() {
     [183, '[FSCR]',   med(mod(SS3+'S', CSI+'S')), DEFAULT, CSI+"26~", DEFAULT],
     [182, '[WINS]',   med(CSI + '15~'),           DEFAULT, CSI+"28~", DEFAULT],
     [216, '[BRIT-]',  med(CSI + '17~'),           DEFAULT, CSI+"29~", DEFAULT],
-    [217, '[BRIT+]',  med(CSI + '18~'),           DEFAULT, CSI+"31~", DEFAULT],
-    [173, '[MUTE]',   med(CSI + '19~'),           DEFAULT, CSI+"32~", DEFAULT],
-    [174, '[VOL-]',   med(CSI + '20~'),           DEFAULT, CSI+"33~", DEFAULT],
-    [175, '[VOL+]',   med(CSI + '21~'),           DEFAULT, CSI+"34~", DEFAULT]
+    [217, '[BRIT+]',  med(CSI + '18~'),           DEFAULT, CSI+"31~", DEFAULT]
+
+    // 173 [MUTE], 174 [VOL-] and 175 [VOL+] are trapped by the Chrome OS
+    // window manager, so we'll never see them. Note that 173 is also
+    // Firefox's -_ keycode.
   );
 };
 
@@ -1362,7 +6330,7 @@ hterm.Keyboard.KeyMap.prototype.onKeyInsert_ = function(e) {
 hterm.Keyboard.KeyMap.prototype.onKeyHome_ = function(e) {
   if (!this.keyboard.homeKeysScroll ^ e.shiftKey) {
     if ((e.altey || e.ctrlKey || e.shiftKey) ||
-        !this.keyboard.applicationKeypad) {
+        !this.keyboard.applicationCursor) {
       return '\x1b[H';
     }
 
@@ -1379,7 +6347,7 @@ hterm.Keyboard.KeyMap.prototype.onKeyHome_ = function(e) {
 hterm.Keyboard.KeyMap.prototype.onKeyEnd_ = function(e) {
   if (!this.keyboard.homeKeysScroll ^ e.shiftKey) {
     if ((e.altKey || e.ctrlKey || e.shiftKey) ||
-        !this.keyboard.applicationKeypad) {
+        !this.keyboard.applicationCursor) {
       return '\x1b[F';
     }
 
@@ -1411,7 +6379,7 @@ hterm.Keyboard.KeyMap.prototype.onKeyPageUp_ = function(e) {
  */
 hterm.Keyboard.KeyMap.prototype.onKeyDel_ = function(e) {
   if (this.keyboard.altBackspaceIsMetaBackspace &&
-      this.keyboard.altIsPressed && !e.altKey)
+      this.keyboard.altKeyPressed && !e.altKey)
     return '\x1b\x7f';
   return '\x1b[3~';
 };
@@ -1483,27 +6451,38 @@ hterm.Keyboard.KeyMap.prototype.onMetaNum_ = function(e, keyDef) {
 };
 
 /**
- * Either send a ^C or allow the browser to interpret the keystroke as a copy
- * command.
- *
- * If there is no selection, or if the user presses Ctrl-Shift-C, then we'll
- * transmit a ^C ('\x03').  If there is a selection, we defer to the
- * browser.  In this case we clear out the selection so the user knows we
- * heard them, and also to give them a chance to send a ^C by just hitting
- * the key again.
+ * Either send a ^C or interpret the keystroke as a copy command.
  */
 hterm.Keyboard.KeyMap.prototype.onCtrlC_ = function(e, keyDef) {
   var selection = this.keyboard.terminal.getDocument().getSelection();
-  if (e.shiftKey || selection.isCollapsed) {
-    // If the shift key is being held or there is no document selection, then
-    // send a ^C.
-    return '\x03';
+
+  if (!selection.isCollapsed) {
+    if (this.keyboard.ctrlCCopy && !e.shiftKey) {
+      // Ctrl-C should copy if there is a selection, send ^C otherwise.
+      // Perform the copy by letting the browser handle Ctrl-C.  On most
+      // browsers, this is the *only* way to place text on the clipboard from
+      // the 'drive-by' web.
+      if (this.keyboard.terminal.clearSelectionAfterCopy) {
+        setTimeout(selection.collapseToEnd.bind(selection), 50);
+      }
+      if (this.keyboard.terminal.prefs_.get('enable-clipboard-notice'))
+        setTimeout(this.keyboard.terminal.showOverlay.bind(this.keyboard.terminal, hterm.notifyCopyMessage, 500), 200);
+      return hterm.Keyboard.KeyActions.PASS;
+    }
+
+    if (!this.keyboard.ctrlCCopy && e.shiftKey) {
+      // Ctrl-Shift-C should copy if there is a selection, send ^C otherwise.
+      // Perform the copy manually.  This only works in situations where
+      // document.execCommand('copy') is allowed.
+      if (this.keyboard.terminal.clearSelectionAfterCopy) {
+        setTimeout(selection.collapseToEnd.bind(selection), 50);
+      }
+      this.keyboard.terminal.copySelectionToClipboard();
+      return hterm.Keyboard.KeyActions.CANCEL;
+    }
   }
 
-  // Otherwise let the browser handle it as a copy command.  Clear the selection
-  // soon after a Ctrl-C copy, so that it frees up Ctrl-C to send ^C.
-  setTimeout(selection.collapseToEnd.bind(selection), 750);
-  return hterm.Keyboard.KeyActions.PASS;
+  return '\x03';
 };
 
 /**
@@ -1534,6 +6513,7 @@ hterm.Keyboard.KeyMap.prototype.onCtrlV_ = function(e, keyDef) {
       (e.shiftKey && !this.keyboard.ctrlVPaste)) {
     return hterm.Keyboard.KeyActions.PASS;
   }
+
   return '\x16';
 };
 
@@ -1573,8 +6553,25 @@ hterm.Keyboard.KeyMap.prototype.onMetaC_ = function(e, keyDef) {
   }
 
   // Otherwise let the browser handle it as a copy command.
-  setTimeout(function() { document.getSelection().collapseToEnd() }, 50);
+  if (this.keyboard.terminal.clearSelectionAfterCopy) {
+    setTimeout(function() { document.getSelection().collapseToEnd() }, 50);
+  }
   return hterm.Keyboard.KeyActions.PASS;
+};
+
+/**
+ * Either PASS or DEFAULT Meta-V, depending on preference.
+ *
+ * Always PASS Meta-Shift-V to allow browser to interpret the keystroke as
+ * a paste command.
+ */
+hterm.Keyboard.KeyMap.prototype.onMetaV_ = function(e, keyDef) {
+  if (e.shiftKey)
+    return hterm.Keyboard.KeyActions.PASS;
+
+  return this.keyboard.passMetaV ?
+      hterm.Keyboard.KeyActions.PASS :
+      hterm.Keyboard.KeyActions.DEFAULT;
 };
 
 /**
@@ -1662,6 +6659,7 @@ hterm.Options = function(opt_copy) {
   this.cursorBlink = opt_copy ? opt_copy.cursorBlink : false;
   this.insertMode = opt_copy ? opt_copy.insertMode : false;
   this.reverseVideo = opt_copy ? opt_copy.reverseVideo : false;
+  this.bracketedPaste = opt_copy ? opt_copy.bracketedPaste : false;
 };
 // SOURCE FILE: hterm/js/hterm_preference_manager.js
 // Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
@@ -1680,301 +6678,384 @@ lib.rtdep('lib.f', 'lib.Storage');
 hterm.PreferenceManager = function(profileId) {
   lib.PreferenceManager.call(this, hterm.defaultStorage,
                              '/hterm/profiles/' + profileId);
-  this.definePreferences
-  ([
-    /**
-     * If set, undoes the Chrome OS Alt-Backspace->DEL remap, so that
-     * alt-backspace indeed is alt-backspace.
-     */
-    ['alt-backspace-is-meta-backspace', false],
+  var defs = hterm.PreferenceManager.defaultPreferences;
+  Object.keys(defs).forEach(function(key) {
+    this.definePreference(key, defs[key]);
+  }.bind(this));
+};
 
-    /**
-     * Set whether the alt key acts as a meta key or as a distinct alt key.
-     */
-    ['alt-is-meta', false],
+hterm.PreferenceManager.defaultPreferences = {
+  /**
+   * Select an AltGr detection hack^Wheuristic.
+   *
+   * null: Autodetect based on navigator.language:
+   *       'en-us' => 'none', else => 'right-alt'
+   * 'none': Disable any AltGr related munging.
+   * 'ctrl-alt': Assume Ctrl+Alt means AltGr.
+   * 'left-alt': Assume left Alt means AltGr.
+   * 'right-alt': Assume right Alt means AltGr.
+   */
+  'alt-gr-mode': null,
 
-    /**
-     * Controls how the alt key is handled.
-     *
-     *  escape....... Send an ESC prefix.
-     *  8-bit........ Add 128 to the unshifted character as in xterm.
-     *  browser-key.. Wait for the keypress event and see what the browser says.
-     *                (This won't work well on platforms where the browser
-     *                 performs a default action for some alt sequences.)
-     */
-    ['alt-sends-what', 'escape'],
+  /**
+   * If set, undoes the Chrome OS Alt-Backspace->DEL remap, so that
+   * alt-backspace indeed is alt-backspace.
+   */
+  'alt-backspace-is-meta-backspace': false,
 
-    /**
-     * Terminal bell sound.  Empty string for no audible bell.
-     */
-    ['audible-bell-sound', 'lib-resource:hterm/audio/bell'],
+  /**
+   * Set whether the alt key acts as a meta key or as a distinct alt key.
+   */
+  'alt-is-meta': false,
 
-    /**
-     * The background color for text with no other color attributes.
-     */
-    ['background-color', 'rgb(16, 16, 16)'],
+  /**
+   * Controls how the alt key is handled.
+   *
+   *  escape....... Send an ESC prefix.
+   *  8-bit........ Add 128 to the unshifted character as in xterm.
+   *  browser-key.. Wait for the keypress event and see what the browser says.
+   *                (This won't work well on platforms where the browser
+   *                 performs a default action for some alt sequences.)
+   */
+  'alt-sends-what': 'escape',
 
-    /**
-     * The background image.
-     */
-    ['background-image', ''],
+  /**
+   * Terminal bell sound.  Empty string for no audible bell.
+   */
+  'audible-bell-sound': 'lib-resource:hterm/audio/bell',
 
-    /**
-     * The background image size,
-     *
-     * Defaults to none.
-     */
-    ['background-size', ''],
+  /**
+   * If true, terminal bells in the background will create a Web
+   * Notification. http://www.w3.org/TR/notifications/
+   *
+   * Displaying notifications requires permission from the user. When this
+   * option is set to true, hterm will attempt to ask the user for permission
+   * if necessary. Note browsers may not show this permission request if it
+   * did not originate from a user action.
+   *
+   * Chrome extensions with the "notfications" permission have permission to
+   * display notifications.
+   */
+  'desktop-notification-bell': false,
 
-    /**
-     * The background image position,
-     *
-     * Defaults to none.
-     */
-    ['background-position', ''],
+  /**
+   * The background color for text with no other color attributes.
+   */
+  'background-color': 'rgb(16, 16, 16)',
 
-    /**
-     * If true, the backspace should send BS ('\x08', aka ^H).  Otherwise
-     * the backspace key should send '\x7f'.
-     */
-    ['backspace-sends-backspace', false],
+  /**
+   * The background image.
+   */
+  'background-image': '',
 
-    /**
-     * Whether or not to close the window when the command exits.
-     */
-    ['close-on-exit', true],
+  /**
+   * The background image size,
+   *
+   * Defaults to none.
+   */
+  'background-size': '',
 
-    /**
-     * Whether or not to blink the cursor by default.
-     */
-    ['cursor-blink', false],
+  /**
+   * The background image position,
+   *
+   * Defaults to none.
+   */
+  'background-position': '',
 
-    /**
-     * The color of the visible cursor.
-     */
-    ['cursor-color', 'rgba(255,0,0,0.5)'],
+  /**
+   * If true, the backspace should send BS ('\x08', aka ^H).  Otherwise
+   * the backspace key should send '\x7f'.
+   */
+  'backspace-sends-backspace': false,
 
-    /**
-     * Override colors in the default palette.
-     *
-     * This can be specified as an array or an object.  If specified as an
-     * object it is assumed to be a sparse array, where each property
-     * is a numeric index into the color palette.
-     *
-     * Values can be specified as css almost any css color value.  This
-     * includes #RGB, #RRGGBB, rgb(...), rgba(...), and any color names
-     * that are also part of the stock X11 rgb.txt file.
-     *
-     * You can use 'null' to specify that the default value should be not
-     * be changed.  This is useful for skipping a small number of indicies
-     * when the value is specified as an array.
-     */
-    ['color-palette-overrides', null],
+  /**
+   * Character map overrides.
+   *
+   * This is specified as an object. It is a sparse array, where each property
+   * is the character set code and the value is an object that is a sparse array
+   * itself. In that sparse array, each property is the received character and
+   * the value is the displayed character.
+   *
+   * For example:
+   *   {"0":{"+":"\u2192",",":"\u2190","-":"\u2191",".":"\u2193","0":"\u2588"}}
+   */
+  'character-map-overrides': null,
 
-    /**
-     * Automatically copy mouse selection to the clipboard.
-     */
-    ['copy-on-select', true],
+  /**
+   * Whether or not to close the window when the command exits.
+   */
+  'close-on-exit': true,
 
-    /**
-     * If true, Ctrl-Plus/Minus/Zero controls zoom.
-     * If false, Ctrl-Shift-Plus/Minus/Zero controls zoom, Ctrl-Minus sends ^_,
-     * Ctrl-Plus/Zero do nothing.
-     */
-    ['ctrl-plus-minus-zero-zoom', true],
+  /**
+   * Whether or not to blink the cursor by default.
+   */
+  'cursor-blink': false,
 
-    /**
-     * Ctrl+V pastes if true, sent to host if false.
-     * Ctrl+Shift+V sends a ^V to host if true, pastes if false.
-     */
-    ['ctrl-v-paste', false],
+  /**
+   * The cursor blink rate in milliseconds.
+   *
+   * A two element array, the first of which is how long the cursor should be
+   * on, second is how long it should be off.
+   */
+  'cursor-blink-cycle': [1000, 500],
 
-    /**
-     * True to enable 8-bit control characters, false to ignore them.
-     *
-     * We'll respect the two-byte versions of these control characters
-     * regardless of this setting.
-     */
-    ['enable-8-bit-control', false],
+  /**
+   * The color of the visible cursor.
+   */
+  'cursor-color': 'rgba(255, 0, 0, 0.5)',
 
-    /**
-     * True if we should use bold weight font for text with the bold/bright
-     * attribute.  False to use the normal weight font.  Null to autodetect.
-     */
-    ['enable-bold', null],
+  /**
+   * Override colors in the default palette.
+   *
+   * This can be specified as an array or an object.  If specified as an
+   * object it is assumed to be a sparse array, where each property
+   * is a numeric index into the color palette.
+   *
+   * Values can be specified as css almost any css color value.  This
+   * includes #RGB, #RRGGBB, rgb(...), rgba(...), and any color names
+   * that are also part of the stock X11 rgb.txt file.
+   *
+   * You can use 'null' to specify that the default value should be not
+   * be changed.  This is useful for skipping a small number of indicies
+   * when the value is specified as an array.
+   */
+  'color-palette-overrides': null,
 
-    /**
-     * True if we should use bright colors (8-15 on a 16 color palette)
-     * for any text with the bold attribute.  False otherwise.
-     */
-    ['enable-bold-as-bright', true],
+  /**
+   * Automatically copy mouse selection to the clipboard.
+   */
+  'copy-on-select': true,
 
-    /**
-     * Allow the host to write directly to the system clipboard.
-     */
-    ['enable-clipboard-notice', true],
+  /**
+   * Whether to use the default window copy behaviour.
+   */
+  'use-default-window-copy': false,
 
-    /**
-     * Allow the host to write directly to the system clipboard.
-     */
-    ['enable-clipboard-write', true],
+  /**
+   * Whether to clear the selection after copying.
+   */
+  'clear-selection-after-copy': true,
 
-    /**
-     * Respect the host's attempt to change the cursor blink status using
-     * DEC Private Mode 12.
-     */
-    ['enable-dec12', false],
+  /**
+   * If true, Ctrl-Plus/Minus/Zero controls zoom.
+   * If false, Ctrl-Shift-Plus/Minus/Zero controls zoom, Ctrl-Minus sends ^_,
+   * Ctrl-Plus/Zero do nothing.
+   */
+  'ctrl-plus-minus-zero-zoom': true,
 
-    /**
-     * The default environment variables.
-     */
-    ['environment', {TERM: 'xterm-256color'}],
+  /**
+   * Ctrl+C copies if true, send ^C to host if false.
+   * Ctrl+Shift+C sends ^C to host if true, copies if false.
+   */
+  'ctrl-c-copy': false,
 
-    /**
-     * Default font family for the terminal text.
-     */
-    ['font-family', ('"DejaVu Sans Mono", "Everson Mono", ' +
-                     'FreeMono, "Menlo", "Terminal", ' +
-                     'monospace')],
+  /**
+   * Ctrl+V pastes if true, send ^V to host if false.
+   * Ctrl+Shift+V sends ^V to host if true, pastes if false.
+   */
+  'ctrl-v-paste': false,
 
-    /**
-     * The default font size in pixels.
-     */
-    ['font-size', 15],
+  /**
+   * Set whether East Asian Ambiguous characters have two column width.
+   */
+  'east-asian-ambiguous-as-two-column': false,
 
-    /**
-     * Anti-aliasing.
-     */
-    ['font-smoothing', 'antialiased'],
+  /**
+   * True to enable 8-bit control characters, false to ignore them.
+   *
+   * We'll respect the two-byte versions of these control characters
+   * regardless of this setting.
+   */
+  'enable-8-bit-control': false,
 
-    /**
-     * The foreground color for text with no other color attributes.
-     */
-    ['foreground-color', 'rgb(240, 240, 240)'],
+  /**
+   * True if we should use bold weight font for text with the bold/bright
+   * attribute.  False to use the normal weight font.  Null to autodetect.
+   */
+  'enable-bold': null,
 
-    /**
-     * If true, home/end will control the terminal scrollbar and shift home/end
-     * will send the VT keycodes.  If false then home/end sends VT codes and
-     * shift home/end scrolls.
-     */
-    ['home-keys-scroll', false],
+  /**
+   * True if we should use bright colors (8-15 on a 16 color palette)
+   * for any text with the bold attribute.  False otherwise.
+   */
+  'enable-bold-as-bright': true,
 
-    /**
-     * Max length of a DCS, OSC, PM, or APS sequence before we give up and
-     * ignore the code.
-     */
-    ['max-string-sequence', 100000],
+  /**
+   * Allow the host to write directly to the system clipboard.
+   */
+  'enable-clipboard-notice': true,
 
-    /**
-     * If true, convert media keys to their Fkey equivalent. If false, let
-     * Chrome handle the keys.
-     */
-    ['media-keys-are-fkeys', false],
+  /**
+   * Allow the host to write directly to the system clipboard.
+   */
+  'enable-clipboard-write': true,
 
-    /**
-     * Set whether the meta key sends a leading escape or not.
-     */
-    ['meta-sends-escape', true],
+  /**
+   * Respect the host's attempt to change the cursor blink status using
+   * DEC Private Mode 12.
+   */
+  'enable-dec12': false,
 
-    /**
-     * Mouse paste button, or null to autodetect.
-     *
-     * For autodetect, we'll try to enable middle button paste for non-X11
-     * platforms.
-     *
-     * On X11 we move it to button 3, but that'll probably be a context menu
-     * in the future.
-     */
-    ['mouse-paste-button', null],
+  /**
+   * The default environment variables.
+   */
+  'environment': {'TERM': 'xterm-256color'},
 
-    /**
-     * If true, page up/down will control the terminal scrollbar and shift
-     * page up/down will send the VT keycodes.  If false then page up/down
-     * sends VT codes and shift page up/down scrolls.
-     */
-    ['page-keys-scroll', false],
+  /**
+   * Default font family for the terminal text.
+   */
+  'font-family': ('"DejaVu Sans Mono", "Everson Mono", ' +
+                  'FreeMono, "Menlo", "Terminal", ' +
+                  'monospace'),
 
-    /**
-     * Set whether we should pass Alt-1..9 to the browser.
-     *
-     * This is handy when running hterm in a browser tab, so that you don't lose
-     * Chrome's "switch to tab" keyboard accelerators.  When not running in a
-     * tab it's better to send these keys to the host so they can be used in
-     * vim or emacs.
-     *
-     * If true, Alt-1..9 will be handled by the browser.  If false, Alt-1..9
-     * will be sent to the host.  If null, autodetect based on browser platform
-     * and window type.
-     */
-    ['pass-alt-number', null],
+  /**
+   * The default font size in pixels.
+   */
+  'font-size': 15,
 
-    /**
-     * Set whether we should pass Ctrl-1..9 to the browser.
-     *
-     * This is handy when running hterm in a browser tab, so that you don't lose
-     * Chrome's "switch to tab" keyboard accelerators.  When not running in a
-     * tab it's better to send these keys to the host so they can be used in
-     * vim or emacs.
-     *
-     * If true, Ctrl-1..9 will be handled by the browser.  If false, Ctrl-1..9
-     * will be sent to the host.  If null, autodetect based on browser platform
-     * and window type.
-     */
-    ['pass-ctrl-number', null],
+  /**
+   * Anti-aliasing.
+   */
+  'font-smoothing': 'antialiased',
 
-    /**
-     * Set whether we should pass Meta-1..9 to the browser.
-     *
-     * This is handy when running hterm in a browser tab, so that you don't lose
-     * Chrome's "switch to tab" keyboard accelerators.  When not running in a
-     * tab it's better to send these keys to the host so they can be used in
-     * vim or emacs.
-     *
-     * If true, Meta-1..9 will be handled by the browser.  If false, Meta-1..9
-     * will be sent to the host.  If null, autodetect based on browser platform
-     * and window type.
-     */
-    ['pass-meta-number', null],
+  /**
+   * The foreground color for text with no other color attributes.
+   */
+  'foreground-color': 'rgb(240, 240, 240)',
 
-    /**
-     * Set the expected encoding for data received from the host.
-     *
-     * Valid values are 'utf-8' and 'raw'.
-     */
-    ['receive-encoding', 'utf-8'],
+  /**
+   * If true, home/end will control the terminal scrollbar and shift home/end
+   * will send the VT keycodes.  If false then home/end sends VT codes and
+   * shift home/end scrolls.
+   */
+  'home-keys-scroll': false,
 
-    /**
-     * If true, scroll to the bottom on any keystroke.
-     */
-    ['scroll-on-keystroke', true],
+  /**
+   * Max length of a DCS, OSC, PM, or APS sequence before we give up and
+   * ignore the code.
+   */
+  'max-string-sequence': 100000,
 
-    /**
-     * If true, scroll to the bottom on terminal output.
-     */
-    ['scroll-on-output', false],
+  /**
+   * If true, convert media keys to their Fkey equivalent. If false, let
+   * Chrome handle the keys.
+   */
+  'media-keys-are-fkeys': false,
 
-    /**
-     * The vertical scrollbar mode.
-     */
-    ['scrollbar-visible', true],
+  /**
+   * Set whether the meta key sends a leading escape or not.
+   */
+  'meta-sends-escape': true,
 
-    /**
-     * Set the encoding for data sent to host.
-     *
-     * Valid values are 'utf-8' and 'raw'.
-     */
-    ['send-encoding', 'utf-8'],
+  /**
+   * Mouse paste button, or null to autodetect.
+   *
+   * For autodetect, we'll try to enable middle button paste for non-X11
+   * platforms.
+   *
+   * On X11 we move it to button 3, but that'll probably be a context menu
+   * in the future.
+   */
+  'mouse-paste-button': null,
 
-    /**
-     * Shift + Insert pastes if true, sent to host if false.
-     */
-    ['shift-insert-paste', true],
+  /**
+   * If true, page up/down will control the terminal scrollbar and shift
+   * page up/down will send the VT keycodes.  If false then page up/down
+   * sends VT codes and shift page up/down scrolls.
+   */
+  'page-keys-scroll': false,
 
-    /**
-     * User stylesheet to include in the terminal document.
-     */
-    ['user-css', ''],
-   ]);
+  /**
+   * Set whether we should pass Alt-1..9 to the browser.
+   *
+   * This is handy when running hterm in a browser tab, so that you don't lose
+   * Chrome's "switch to tab" keyboard accelerators.  When not running in a
+   * tab it's better to send these keys to the host so they can be used in
+   * vim or emacs.
+   *
+   * If true, Alt-1..9 will be handled by the browser.  If false, Alt-1..9
+   * will be sent to the host.  If null, autodetect based on browser platform
+   * and window type.
+   */
+  'pass-alt-number': null,
+
+  /**
+   * Set whether we should pass Ctrl-1..9 to the browser.
+   *
+   * This is handy when running hterm in a browser tab, so that you don't lose
+   * Chrome's "switch to tab" keyboard accelerators.  When not running in a
+   * tab it's better to send these keys to the host so they can be used in
+   * vim or emacs.
+   *
+   * If true, Ctrl-1..9 will be handled by the browser.  If false, Ctrl-1..9
+   * will be sent to the host.  If null, autodetect based on browser platform
+   * and window type.
+   */
+  'pass-ctrl-number': null,
+
+  /**
+   * Set whether we should pass Meta-1..9 to the browser.
+   *
+   * This is handy when running hterm in a browser tab, so that you don't lose
+   * Chrome's "switch to tab" keyboard accelerators.  When not running in a
+   * tab it's better to send these keys to the host so they can be used in
+   * vim or emacs.
+   *
+   * If true, Meta-1..9 will be handled by the browser.  If false, Meta-1..9
+   * will be sent to the host.  If null, autodetect based on browser platform
+   * and window type.
+   */
+  'pass-meta-number': null,
+
+  /**
+   * Set whether meta-V gets passed to host.
+   */
+  'pass-meta-v': true,
+
+  /**
+   * Set the expected encoding for data received from the host.
+   *
+   * Valid values are 'utf-8' and 'raw'.
+   */
+  'receive-encoding': 'utf-8',
+
+  /**
+   * If true, scroll to the bottom on any keystroke.
+   */
+  'scroll-on-keystroke': true,
+
+  /**
+   * If true, scroll to the bottom on terminal output.
+   */
+  'scroll-on-output': false,
+
+  /**
+   * The vertical scrollbar mode.
+   */
+  'scrollbar-visible': true,
+
+  /**
+   * The multiplier for the pixel delta in mousewheel event caused by the scroll
+   * wheel. Alters how fast the page scrolls.
+   */
+  'scroll-wheel-move-multiplier': 1,
+
+  /**
+   * Set the encoding for data sent to host.
+   *
+   * Valid values are 'utf-8' and 'raw'.
+   */
+  'send-encoding': 'utf-8',
+
+  /**
+   * Shift + Insert pastes if true, sent to host if false.
+   */
+  'shift-insert-paste': true,
+
+  /**
+   * User stylesheet to include in the terminal document.
+   */
+  'user-css': ''
 };
 
 hterm.PreferenceManager.prototype = {
@@ -2341,9 +7422,18 @@ hterm.Screen.prototype.clearCursorRow = function() {
     text = lib.f.getWhitespace(this.columnCount_);
   }
 
+  // We shouldn't honour inverse colors when clearing an area, to match
+  // xterm's back color erase behaviour.
+  var inverse = this.textAttributes.inverse;
+  this.textAttributes.inverse = false;
+  this.textAttributes.syncColors();
+
   var node = this.textAttributes.createContainer(text);
   this.cursorRowNode_.appendChild(node);
   this.cursorNode_ = node;
+
+  this.textAttributes.inverse = inverse;
+  this.textAttributes.syncColors();
 };
 
 /**
@@ -2432,7 +7522,12 @@ hterm.Screen.prototype.setCursorPosition = function(row, column) {
  * cursor position.
  */
 hterm.Screen.prototype.syncSelectionCaret = function(selection) {
-  selection.collapse(this.cursorNode_, this.cursorOffset_);
+  try {
+    selection.collapse(this.cursorNode_, this.cursorOffset_);
+  } catch (firefoxIgnoredException) {
+    // FF can throw an exception if the range is off, rather than just not
+    // performing the collapse.
+  }
 };
 
 /**
@@ -2550,16 +7645,20 @@ hterm.Screen.prototype.insertString = function(str) {
     // whitespace.
     var ws = lib.f.getWhitespace(-reverseOffset);
 
-    // This whitespace should be completely unstyled.  Underline and background
-    // color would be visible on whitespace, so we can't use one of those
-    // spans to hold the text.
-    if (!(this.textAttributes.underline || this.textAttributes.background ||
-          this.textAttributes.wcNode)) {
+    // This whitespace should be completely unstyled.  Underline, background
+    // color, and strikethrough would be visible on whitespace, so we can't use
+    // one of those spans to hold the text.
+    if (!(this.textAttributes.underline ||
+          this.textAttributes.strikethrough ||
+          this.textAttributes.background ||
+          this.textAttributes.wcNode ||
+          this.textAttributes.tileData != null)) {
       // Best case scenario, we can just pretend the spaces were part of the
       // original string.
       str = ws + str;
     } else if (cursorNode.nodeType == 3 ||
                !(cursorNode.wcNode ||
+                 cursorNode.tileNode ||
                  cursorNode.style.textDecoration ||
                  cursorNode.style.backgroundColor)) {
       // Second best case, the current node is able to hold the whitespace.
@@ -2910,11 +8009,6 @@ hterm.Screen.prototype.setRange_ = function(row, start, end, range) {
 /**
  * Expands selection to surround URLs.
  *
- * Uses this regular expression to expand the selection:
- * [^\s\[\](){}<>"'\^!@#$%&*,.;:~`]
- * [^\s\[\](){}<>"'\^]*
- * [^\s\[\](){}<>"'\^!@#$%&*,.;:~`]
- *
  * @param {Selection} selection Selection to expand.
  **/
 hterm.Screen.prototype.expandSelection = function(selection) {
@@ -2940,13 +8034,15 @@ hterm.Screen.prototype.expandSelection = function(selection) {
   if (endPosition == -1)
     return;
 
-  var outsideMatch = '[^\\s\\[\\](){}<>"\'\\^!@#$%&*,.;:~`]';
+  // Matches can start with '~' or '.', since paths frequently do.
+  var leftMatch   = '[^\\s\\[\\](){}<>"\'\\^!@#$%&*,;:`]';
+  var rightMatch  = '[^\\s\\[\\](){}<>"\'\\^!@#$%&*,;:~.`]';
   var insideMatch = '[^\\s\\[\\](){}<>"\'\\^]*';
 
   //Move start to the left.
   var rowText = this.getLineText_(row);
   var lineUpToRange = lib.wc.substring(rowText, 0, endPosition);
-  var leftRegularExpression = new RegExp(outsideMatch + insideMatch + "$");
+  var leftRegularExpression = new RegExp(leftMatch + insideMatch + "$");
   var expandedStart = lineUpToRange.search(leftRegularExpression);
   if (expandedStart == -1 || expandedStart > startPosition)
     return;
@@ -2954,7 +8050,7 @@ hterm.Screen.prototype.expandSelection = function(selection) {
   //Move end to the right.
   var lineFromRange = lib.wc.substring(rowText, startPosition,
                                        lib.wc.strWidth(rowText));
-  var rightRegularExpression = new RegExp("^" + insideMatch + outsideMatch);
+  var rightRegularExpression = new RegExp("^" + insideMatch + rightMatch);
   var found = lineFromRange.match(rightRegularExpression);
   if (!found)
     return;
@@ -2972,7 +8068,7 @@ hterm.Screen.prototype.expandSelection = function(selection) {
 
 'use strict';
 
-lib.rtdep('hterm.PubSub', 'hterm.Size');
+lib.rtdep('lib.f', 'hterm.PubSub', 'hterm.Size');
 
 /**
  * A 'viewport' view of fixed-height rows with support for selection and
@@ -3032,6 +8128,10 @@ hterm.ScrollPort = function(rowProvider) {
   // syncScrollHeight().
   this.lastRowCount_ = 0;
 
+  // The scroll wheel pixel delta multiplier to increase/descrease
+  // the scroll speed of mouse wheel events. See: http://goo.gl/sXelnq
+  this.scrollWheelMultiplier_ = 1;
+
   /**
    * True if the last scroll caused the scrollport to show the final row.
    */
@@ -3043,7 +8143,12 @@ hterm.ScrollPort = function(rowProvider) {
   /**
    * A guess at the current scrollbar width, fixed in resize().
    */
-  this.currentScrollbarWidthPx = 16
+  this.currentScrollbarWidthPx = 16;
+
+  /**
+   * Whether the ctrl-v key on the screen should paste.
+   */
+  this.ctrlVPaste = false;
 
   this.div_ = null;
   this.document_ = null;
@@ -3222,6 +8327,7 @@ hterm.ScrollPort.Selection.prototype.sync = function() {
   this.isMultiline = anchorRow.rowIndex != focusRow.rowIndex;
 };
 
+
 /**
  * Turn a div into this hterm.ScrollPort.
  */
@@ -3235,6 +8341,11 @@ hterm.ScrollPort.prototype.decorate = function(div) {
       'position: absolute;' +
       'width: 100%');
 
+  // Set the iframe src to # in FF.  Otherwise when the frame's
+  // load event fires in FF it clears out the content of the iframe.
+  if ('mozInnerScreenX' in window)  // detect a FF only property
+    this.iframe_.src = '#';
+
   div.appendChild(this.iframe_);
 
   this.iframe_.contentWindow.addEventListener('resize',
@@ -3247,7 +8358,8 @@ hterm.ScrollPort.prototype.decorate = function(div) {
       'height: 100%;' +
       'width: 100%;' +
       'overflow: hidden;' +
-      '-webkit-user-select: none;');
+      '-webkit-user-select: none;' +
+      '-moz-user-select: none;');
 
   var style = doc.createElement('style');
   style.textContent = 'x-row {}';
@@ -3279,18 +8391,12 @@ hterm.ScrollPort.prototype.decorate = function(div) {
 
   this.screen_.addEventListener('scroll', this.onScroll_.bind(this));
   this.screen_.addEventListener('mousewheel', this.onScrollWheel_.bind(this));
+  this.screen_.addEventListener(
+      'DOMMouseScroll', this.onScrollWheel_.bind(this));
   this.screen_.addEventListener('copy', this.onCopy_.bind(this));
   this.screen_.addEventListener('paste', this.onPaste_.bind(this));
 
-  // We send focus to this element just before a paste happens, so we can
-  // capture the pasted text and forward it on to someone who cares.
-  this.pasteTarget_ = doc.createElement('textarea');
-  this.pasteTarget_.setAttribute('tabindex', '-1');
-  this.pasteTarget_.style.cssText = (
-    'position: absolute;' +
-    'top: -999px;');
-
-  doc.body.appendChild(this.pasteTarget_);
+  doc.body.addEventListener('keydown', this.onBodyKeyDown_.bind(this));
 
   // This is the main container for the fixed rows.
   this.rowNodes_ = doc.createElement('div');
@@ -3298,7 +8404,8 @@ hterm.ScrollPort.prototype.decorate = function(div) {
       'display: block;' +
       'position: fixed;' +
       'overflow: hidden;' +
-      '-webkit-user-select: text;');
+      '-webkit-user-select: text;' +
+      '-moz-user-select: text;');
   this.screen_.appendChild(this.rowNodes_);
 
   // Two nodes to hold offscreen text during the copy event.
@@ -3346,6 +8453,24 @@ hterm.ScrollPort.prototype.decorate = function(div) {
       'top: 0;' +
       'left: 0;' +
       'visibility: hidden');
+
+
+  // We send focus to this element just before a paste happens, so we can
+  // capture the pasted text and forward it on to someone who cares.
+  this.pasteTarget_ = doc.createElement('textarea');
+  this.pasteTarget_.setAttribute('tabindex', '-1');
+  this.pasteTarget_.style.cssText = (
+    'position: absolute;' +
+    'height: 1px;' +
+    'width: 1px;' +
+    'left: 0px; ' +
+    'bottom: 0px;' +
+    'opacity: 0');
+  this.pasteTarget_.contentEditable = true;
+
+  this.screen_.appendChild(this.pasteTarget_);
+  this.pasteTarget_.addEventListener(
+      'textInput', this.handlePasteTargetTextInput_.bind(this));
 
   this.resize();
 };
@@ -3421,6 +8546,10 @@ hterm.ScrollPort.prototype.setBackgroundSize = function(size) {
 
 hterm.ScrollPort.prototype.setBackgroundPosition = function(position) {
   this.screen_.style.backgroundPosition = position;
+};
+
+hterm.ScrollPort.prototype.setCtrlVPaste = function(ctrlVPaste) {
+  this.ctrlVPaste = ctrlVPaste;
 };
 
 /**
@@ -3560,11 +8689,15 @@ hterm.ScrollPort.prototype.measureCharacterSize = function(opt_weight) {
         'height: auto !important;' +
         'width: auto !important;');
 
-    this.ruler_.textContent = ('XXXXXXXXXXXXXXXXXXXX' +
-                               'XXXXXXXXXXXXXXXXXXXX' +
-                               'XXXXXXXXXXXXXXXXXXXX' +
-                               'XXXXXXXXXXXXXXXXXXXX' +
-                               'XXXXXXXXXXXXXXXXXXXX');
+    // We need to put the text in a span to make the size calculation
+    // work properly in Firefox
+    this.rulerSpan_ = this.document_.createElement('span');
+    this.rulerSpan_.textContent = ('XXXXXXXXXXXXXXXXXXXX' +
+                                   'XXXXXXXXXXXXXXXXXXXX' +
+                                   'XXXXXXXXXXXXXXXXXXXX' +
+                                   'XXXXXXXXXXXXXXXXXXXX' +
+                                   'XXXXXXXXXXXXXXXXXXXX');
+    this.ruler_.appendChild(this.rulerSpan_);
 
     this.rulerBaseline_ = this.document_.createElement('span');
     // We want to collapse it on the baseline
@@ -3572,16 +8705,13 @@ hterm.ScrollPort.prototype.measureCharacterSize = function(opt_weight) {
     this.rulerBaseline_.textContent = 'X';
   }
 
-  this.ruler_.style.fontWeight = opt_weight || '';
+  this.rulerSpan_.style.fontWeight = opt_weight || '';
 
   this.rowNodes_.appendChild(this.ruler_);
-  var rulerSize = hterm.getClientSize(this.ruler_);
+  var rulerSize = hterm.getClientSize(this.rulerSpan_);
 
-  // In some fonts, underscores actually show up below the reported height.
-  // We add one to the height here to compensate, and have to add a bottom
-  // border to text with a background color over in text_attributes.js.
   var size = new hterm.Size(rulerSize.width / this.ruler_.textContent.length,
-                            rulerSize.height + 1);
+                            rulerSize.height);
 
   this.ruler_.appendChild(this.rulerBaseline_);
   size.baseline = this.rulerBaseline_.offsetTop;
@@ -3652,8 +8782,8 @@ hterm.ScrollPort.prototype.syncRowNodesDimensions_ = function() {
 
   // We don't want to show a partial row because it would be distracting
   // in a terminal, so we floor any fractional row count.
-  this.visibleRowCount = Math.floor(
-      screenSize.height / this.characterSize.height);
+  this.visibleRowCount = lib.f.smartFloorDivide(
+      screenSize.height, this.characterSize.height);
 
   // Then compute the height of our integral number of rows.
   var visibleRowsHeight = this.visibleRowCount * this.characterSize.height;
@@ -4114,7 +9244,8 @@ hterm.ScrollPort.prototype.scrollRowToBottom = function(rowIndex) {
  * returns the row that *should* be at the top.
  */
 hterm.ScrollPort.prototype.getTopRowIndex = function() {
-  return Math.floor(this.screen_.scrollTop / this.characterSize.height);
+  return lib.f.smartFloorDivide(
+      this.screen_.scrollTop, this.characterSize.height);
 };
 
 /**
@@ -4172,7 +9303,13 @@ hterm.ScrollPort.prototype.onScrollWheel_ = function(e) {
   if (e.defaultPrevented)
     return;
 
-  var top = this.screen_.scrollTop - e.wheelDeltaY;
+  // In FF, the event is DOMMouseScroll and puts the scroll pixel delta in the
+  // 'detail' field of the event.  It also flips the mapping of which direction
+  // a negative number means in the scroll.
+  var delta = e.type == 'DOMMouseScroll' ? (-1 * e.detail) : e.wheelDeltaY;
+  delta *= this.scrollWheelMultiplier_;
+
+  var top = this.screen_.scrollTop - delta;
   if (top < 0)
     top = 0;
 
@@ -4274,6 +9411,20 @@ hterm.ScrollPort.prototype.onCopy_ = function(e) {
 };
 
 /**
+ * Focuses on the paste target on a ctrl-v keydown event, as in
+ * FF a content editable element must be focused before the paste event.
+ */
+hterm.ScrollPort.prototype.onBodyKeyDown_ = function(e) {
+  if (!this.ctrlVPaste)
+    return;
+
+  var key = String.fromCharCode(e.which);
+  var lowerKey = key.toLowerCase();
+  if ((e.ctrlKey || e.metaKey) && lowerKey == "v")
+    this.pasteTarget_.focus();
+};
+
+/**
  * Handle a paste event on the the ScrollPort's screen element.
  */
 hterm.ScrollPort.prototype.onPaste_ = function(e) {
@@ -4288,10 +9439,26 @@ hterm.ScrollPort.prototype.onPaste_ = function(e) {
 };
 
 /**
+ * Handles a textInput event on the paste target. Stops this from
+ * propagating as we want this to be handled in the onPaste_ method.
+ */
+hterm.ScrollPort.prototype.handlePasteTargetTextInput_ = function(e) {
+  e.stopPropagation();
+};
+
+/**
  * Set the vertical scrollbar mode of the ScrollPort.
  */
 hterm.ScrollPort.prototype.setScrollbarVisible = function(state) {
   this.screen_.style.overflowY = state ? 'scroll' : 'hidden';
+};
+
+/**
+ * Set scroll wheel multiplier. This alters how much the screen scrolls on
+ * mouse wheel events.
+ */
+hterm.ScrollPort.prototype.setScrollWheelMoveMultipler = function(multiplier) {
+  this.scrollWheelMultiplier_ = multiplier;
 };
 // SOURCE FILE: hterm/js/hterm_terminal.js
 // Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
@@ -4300,8 +9467,8 @@ hterm.ScrollPort.prototype.setScrollbarVisible = function(state) {
 
 'use strict';
 
-lib.rtdep('lib.colors', 'lib.PreferenceManager', 'lib.resource',
-          'hterm.Keyboard', 'hterm.Options', 'hterm.PreferenceManager',
+lib.rtdep('lib.colors', 'lib.PreferenceManager', 'lib.resource', 'lib.wc',
+          'lib.f', 'hterm.Keyboard', 'hterm.Options', 'hterm.PreferenceManager',
           'hterm.Screen', 'hterm.ScrollPort', 'hterm.Size',
           'hterm.TextAttributes', 'hterm.VT');
 
@@ -4380,6 +9547,13 @@ hterm.Terminal = function(opt_profileId) {
   // The current color of the cursor.
   this.cursorColor_ = null;
 
+  // Cursor blink on/off cycle in ms, overwritten by prefs once they're loaded.
+  this.cursorBlinkCycle_ = [100, 100];
+
+  // Pre-bound onCursorBlink_ handler, so we don't have to do this for each
+  // cursor on/off servicing.
+  this.myOnCursorBlink_ = this.onCursorBlink_.bind(this);
+
   // These prefs are cached so we don't have to read from local storage with
   // each output and keystroke.  They are initialized by the preference manager.
   this.backgroundColor_ = null;
@@ -4394,6 +9568,13 @@ hterm.Terminal = function(opt_profileId) {
   // Terminal bell sound.
   this.bellAudio_ = this.document_.createElement('audio');
   this.bellAudio_.setAttribute('preload', 'auto');
+
+  // All terminal bell notifications that have been generated (not necessarily
+  // shown).
+  this.bellNotificationList_ = [];
+
+  // Whether we have permission to display notifications.
+  this.desktopNotificationBell_ = false;
 
   // Cursor position and attributes saved with DECSC.
   this.savedOptions_ = {};
@@ -4419,6 +9600,11 @@ hterm.Terminal = function(opt_profileId) {
 
   this.copyOnSelect = null;
   this.mousePasteButton = null;
+
+  // Whether to use the default window copy behaviour.
+  this.useDefaultWindowCopy = false;
+
+  this.clearSelectionAfterCopy = true;
 
   this.realizeSize_(80, 24);
   this.setDefaultTabStops();
@@ -4471,6 +9657,25 @@ hterm.Terminal.prototype.setProfile = function(profileId, opt_callback) {
 
   this.prefs_ = new hterm.PreferenceManager(this.profileId_);
   this.prefs_.addObservers(null, {
+    'alt-gr-mode': function(v) {
+      if (v == null) {
+        if (navigator.language.toLowerCase() == 'en-us') {
+          v = 'none';
+        } else {
+          v = 'right-alt';
+        }
+      } else if (typeof v == 'string') {
+        v = v.toLowerCase();
+      } else {
+        v = 'none';
+      }
+
+      if (!/^(none|ctrl-alt|left-alt|right-alt)$/.test(v))
+        v = 'none';
+
+      terminal.keyboard.altGrMode = v;
+    },
+
     'alt-backspace-is-meta-backspace': function(v) {
       terminal.keyboard.altBackspaceIsMetaBackspace = v;
     },
@@ -4496,6 +9701,25 @@ hterm.Terminal.prototype.setProfile = function(profileId, opt_callback) {
       }
     },
 
+    'desktop-notification-bell': function(v) {
+      if (v && Notification) {
+        terminal.desktopNotificationBell_ =
+            Notification.permission === 'granted';
+        if (!terminal.desktopNotificationBell_) {
+          // Note: We don't call Notification.requestPermission here because
+          // Chrome requires the call be the result of a user action (such as an
+          // onclick handler), and pref listeners are run asynchronously.
+          //
+          // A way of working around this would be to display a dialog in the
+          // terminal with a "click-to-request-permission" button.
+          console.warn('desktop-notification-bell is true but we do not have ' +
+                       'permission to display notifications.');
+        }
+      } else {
+        terminal.desktopNotificationBell_ = false;
+      }
+    },
+
     'background-color': function(v) {
       terminal.setBackgroundColor(v);
     },
@@ -4516,8 +9740,37 @@ hterm.Terminal.prototype.setProfile = function(profileId, opt_callback) {
       terminal.keyboard.backspaceSendsBackspace = v;
     },
 
+    'character-map-overrides': function(v) {
+      if (!(v == null || v instanceof Object)) {
+        console.warn('Preference character-map-modifications is not an ' +
+                     'object: ' + v);
+        return;
+      }
+
+      for (var code in v) {
+        var glmap = hterm.VT.CharacterMap.maps[code].glmap;
+        for (var received in v[code]) {
+          glmap[received] = v[code][received];
+        }
+        hterm.VT.CharacterMap.maps[code].reset(glmap);
+      }
+    },
+
     'cursor-blink': function(v) {
       terminal.setCursorBlink(!!v);
+    },
+
+    'cursor-blink-cycle': function(v) {
+        if (v instanceof Array &&
+            typeof v[0] == 'number' &&
+            typeof v[1] == 'number') {
+          terminal.cursorBlinkCycle_ = v;
+        } else if (typeof v == 'number') {
+          terminal.cursorBlinkCycle_ = [v, v];
+        } else {
+          // Fast blink indicates an error.
+          terminal.cursorBlinkCycle_ = [100, 100];
+        }
     },
 
     'cursor-color': function(v) {
@@ -4557,12 +9810,29 @@ hterm.Terminal.prototype.setProfile = function(profileId, opt_callback) {
       terminal.copyOnSelect = !!v;
     },
 
+    'use-default-window-copy': function(v) {
+      terminal.useDefaultWindowCopy = !!v;
+    },
+
+    'clear-selection-after-copy': function(v) {
+      terminal.clearSelectionAfterCopy = !!v;
+    },
+
     'ctrl-plus-minus-zero-zoom': function(v) {
       terminal.keyboard.ctrlPlusMinusZeroZoom = v;
     },
 
+    'ctrl-c-copy': function(v) {
+      terminal.keyboard.ctrlCCopy = v;
+    },
+
     'ctrl-v-paste': function(v) {
       terminal.keyboard.ctrlVPaste = v;
+      terminal.scrollPort_.setCtrlVPaste(v);
+    },
+
+    'east-asian-ambiguous-as-two-column': function(v) {
+      lib.wc.regardCjkAmbiguous = v;
     },
 
     'enable-8-bit-control': function(v) {
@@ -4662,6 +9932,10 @@ hterm.Terminal.prototype.setProfile = function(profileId, opt_callback) {
       terminal.passMetaNumber = v;
     },
 
+    'pass-meta-v': function(v) {
+      terminal.keyboard.passMetaV = v;
+    },
+
     'receive-encoding': function(v) {
        if (!(/^(utf-8|raw)$/).test(v)) {
          console.warn('Invalid value for "receive-encoding": ' + v);
@@ -4681,6 +9955,10 @@ hterm.Terminal.prototype.setProfile = function(profileId, opt_callback) {
 
     'scrollbar-visible': function(v) {
       terminal.setScrollbarVisible(v);
+    },
+
+    'scroll-wheel-move-multiplier': function(v) {
+      terminal.setScrollWheelMoveMultipler(v);
     },
 
     'send-encoding': function(v) {
@@ -4707,6 +9985,21 @@ hterm.Terminal.prototype.setProfile = function(profileId, opt_callback) {
     if (opt_callback)
       opt_callback();
   }.bind(this));
+};
+
+
+/**
+ * Returns the preferences manager used for configuring this terminal.
+ */
+hterm.Terminal.prototype.getPrefs = function() {
+  return this.prefs_;
+};
+
+/**
+ * Enable or disable bracketed paste mode.
+ */
+hterm.Terminal.prototype.setBracketedPaste = function(state) {
+  this.options_.bracketedPaste = state;
 };
 
 /**
@@ -4828,7 +10121,7 @@ hterm.Terminal.prototype.isPrimaryScreen = function() {
  * terminal.
  */
 hterm.Terminal.prototype.installKeyboard = function() {
-  this.keyboard.installKeyboard(this.scrollPort_.getScreenNode());
+  this.keyboard.installKeyboard(this.scrollPort_.getDocument().body);
 }
 
 /**
@@ -5005,8 +10298,9 @@ hterm.Terminal.prototype.setWidth = function(columnCount) {
     return;
   }
 
-  this.div_.style.width = this.scrollPort_.characterSize.width *
-      columnCount + this.scrollPort_.currentScrollbarWidthPx + 'px';
+  this.div_.style.width = Math.ceil(
+      this.scrollPort_.characterSize.width *
+      columnCount + this.scrollPort_.currentScrollbarWidthPx) + 'px';
   this.realizeSize_(columnCount, this.screenSize.height);
   this.scheduleSyncCursorPosition_();
 };
@@ -5219,6 +10513,9 @@ hterm.Terminal.prototype.softReset = function() {
   // Reset terminal options to their default values.
   this.options_ = new hterm.Options();
 
+  // We show the cursor on soft reset but do not alter the blink state.
+  this.options_.cursorBlink = !!this.timeouts_.cursorBlink;
+
   // Xterm also resets the color palette on soft reset, even though it doesn't
   // seem to be documented anywhere.
   this.primaryScreen_.textAttributes.resetColorPalette();
@@ -5369,6 +10666,8 @@ hterm.Terminal.prototype.decorate = function(div) {
   this.syncFontFamily();
 
   this.setScrollbarVisible(this.prefs_.get('scrollbar-visible'));
+  this.setScrollWheelMoveMultipler(
+      this.prefs_.get('scroll-wheel-move-multiplier'));
 
   this.document_ = this.scrollPort_.getDocument();
 
@@ -5383,6 +10682,12 @@ hterm.Terminal.prototype.decorate = function(div) {
 
   screenNode.addEventListener(
       'focus', this.onFocusChange_.bind(this, true));
+  // Listen for mousedown events on the screenNode as in FF the focus
+  // events don't bubble.
+  screenNode.addEventListener('mousedown', function() {
+    setTimeout(this.onFocusChange_.bind(this, true));
+  }.bind(this));
+
   screenNode.addEventListener(
       'blur', this.onFocusChange_.bind(this, false));
 
@@ -5413,7 +10718,8 @@ hterm.Terminal.prototype.decorate = function(div) {
        'display: block;' +
        'width: ' + this.scrollPort_.characterSize.width + 'px;' +
        'height: ' + this.scrollPort_.characterSize.height + 'px;' +
-       '-webkit-transition: opacity, background-color 100ms linear;');
+       '-webkit-transition: opacity, background-color 100ms linear;' +
+       '-moz-transition: opacity, background-color 100ms linear;');
 
   this.setCursorColor(this.prefs_.get('cursor-color'));
   this.setCursorBlink(!!this.prefs_.get('cursor-blink'));
@@ -6265,10 +11571,47 @@ hterm.Terminal.prototype.cursorDown = function(count) {
 /**
  * Move the cursor left a specified number of columns.
  *
+ * If reverse wraparound mode is enabled and the previous row wrapped into
+ * the current row then we back up through the wraparound as well.
+ *
  * @param {integer} count The number of columns to move the cursor.
  */
 hterm.Terminal.prototype.cursorLeft = function(count) {
-  return this.cursorRight(-(count || 1));
+  count = count || 1;
+
+  if (count < 1)
+    return;
+
+  var currentColumn = this.screen_.cursorPosition.column;
+  if (this.options_.reverseWraparound) {
+    if (this.screen_.cursorPosition.overflow) {
+      // If this cursor is in the right margin, consume one count to get it
+      // back to the last column.  This only applies when we're in reverse
+      // wraparound mode.
+      count--;
+      this.clearCursorOverflow();
+
+      if (!count)
+        return;
+    }
+
+    var newRow = this.screen_.cursorPosition.row;
+    var newColumn = currentColumn - count;
+    if (newColumn < 0) {
+      newRow = newRow - Math.floor(count / this.screenSize.width) - 1;
+      if (newRow < 0) {
+        // xterm also wraps from row 0 to the last row.
+        newRow = this.screenSize.height + newRow % this.screenSize.height;
+      }
+      newColumn = this.screenSize.width + newColumn % this.screenSize.width;
+    }
+
+    this.setCursorPosition(Math.max(newRow, 0), newColumn);
+
+  } else {
+    var newColumn = Math.max(currentColumn - count, 0);
+    this.setCursorColumn(newColumn);
+  }
 };
 
 /**
@@ -6278,6 +11621,10 @@ hterm.Terminal.prototype.cursorLeft = function(count) {
  */
 hterm.Terminal.prototype.cursorRight = function(count) {
   count = count || 1;
+
+  if (count < 1)
+    return;
+
   var column = lib.f.clamp(this.screen_.cursorPosition.column + count,
                            0, this.screenSize.width - 1);
   this.setCursorColumn(column);
@@ -6317,17 +11664,26 @@ hterm.Terminal.prototype.ringBell = function() {
       self.cursorNode_.style.backgroundColor = self.prefs_.get('cursor-color');
     }, 200);
 
+  // bellSquelchTimeout_ affects both audio and notification bells.
+  if (this.bellSquelchTimeout_)
+    return;
+
   if (this.bellAudio_.getAttribute('src')) {
-    if (this.bellSquelchTimeout_)
-      return;
-
     this.bellAudio_.play();
-
     this.bellSequelchTimeout_ = setTimeout(function() {
         delete this.bellSquelchTimeout_;
       }.bind(this), 500);
   } else {
     delete this.bellSquelchTimeout_;
+  }
+
+  if (this.desktopNotificationBell_ && !this.document_.hasFocus()) {
+    var n = new Notification(
+        lib.f.replaceVars(hterm.desktopNotificationTitle,
+                          {'title': window.document.title || 'hterm'}));
+    this.bellNotificationList_.push(n);
+    // TODO: Should we try to raise the window here?
+    n.onclick = function() { self.closeBellNotifications_(); };
   }
 };
 
@@ -6479,6 +11835,10 @@ hterm.Terminal.prototype.setCursorVisible = function(state) {
   this.options_.cursorVisible = state;
 
   if (!state) {
+    if (this.timeouts_.cursorBlink) {
+      clearTimeout(this.timeouts_.cursorBlink);
+      delete this.timeouts_.cursorBlink;
+    }
     this.cursorNode_.style.opacity = '0';
     return;
   }
@@ -6491,8 +11851,7 @@ hterm.Terminal.prototype.setCursorVisible = function(state) {
     if (this.timeouts_.cursorBlink)
       return;
 
-    this.timeouts_.cursorBlink = setInterval(this.onCursorBlink_.bind(this),
-                                             500);
+    this.onCursorBlink_();
   } else {
     if (this.timeouts_.cursorBlink) {
       clearTimeout(this.timeouts_.cursorBlink);
@@ -6516,6 +11875,13 @@ hterm.Terminal.prototype.syncCursorPosition_ = function() {
     this.cursorNode_.style.top = -this.scrollPort_.characterSize.height + 'px';
     return;
   }
+
+  if (this.options_.cursorVisible &&
+      this.cursorNode_.style.display == 'none') {
+    // Re-display the terminal cursor if it was hidden by the mouse cursor.
+    this.cursorNode_.style.display = '';
+  }
+
 
   this.cursorNode_.style.top = this.scrollPort_.visibleRowTopMargin +
       this.scrollPort_.characterSize.height * (cursorRowIndex - topRowIndex) +
@@ -6617,7 +11983,9 @@ hterm.Terminal.prototype.showZoomWarning_ = function(state) {
         'right: 1.2em;' +
         'position: absolute;' +
         '-webkit-text-size-adjust: none;' +
-        '-webkit-user-select: none;');
+        '-webkit-user-select: none;' +
+        '-moz-text-size-adjust: none;' +
+        '-moz-user-select: none;');
   }
 
   this.zoomWarningNode_.textContent = lib.MessageManager.replaceReferences(
@@ -6660,7 +12028,9 @@ hterm.Terminal.prototype.showOverlay = function(msg, opt_timeout) {
         'padding: 0.2em 0.5em 0.2em 0.5em;' +
         'position: absolute;' +
         '-webkit-user-select: none;' +
-        '-webkit-transition: opacity 180ms ease-in;');
+        '-webkit-transition: opacity 180ms ease-in;' +
+        '-moz-user-select: none;' +
+        '-moz-transition: opacity 180ms ease-in;');
 
     this.overlayNode_.addEventListener('mousedown', function(e) {
       e.preventDefault();
@@ -6681,9 +12051,10 @@ hterm.Terminal.prototype.showOverlay = function(msg, opt_timeout) {
   var divSize = hterm.getClientSize(this.div_);
   var overlaySize = hterm.getClientSize(this.overlayNode_);
 
-  this.overlayNode_.style.top = (divSize.height - overlaySize.height) / 2;
+  this.overlayNode_.style.top =
+      (divSize.height - overlaySize.height) / 2 + 'px';
   this.overlayNode_.style.left = (divSize.width - overlaySize.width -
-      this.scrollPort_.currentScrollbarWidthPx) / 2;
+      this.scrollPort_.currentScrollbarWidthPx) / 2 + 'px';
 
   var self = this;
 
@@ -6724,6 +12095,7 @@ hterm.Terminal.prototype.copyStringToClipboard = function(str) {
   copySource.textContent = str;
   copySource.style.cssText = (
       '-webkit-user-select: text;' +
+      '-moz-user-select: text;' +
       'position: absolute;' +
       'top: -99px');
 
@@ -6739,8 +12111,12 @@ hterm.Terminal.prototype.copyStringToClipboard = function(str) {
 
   hterm.copySelectionToClipboard(this.document_);
 
-  selection.collapse(anchorNode, anchorOffset);
-  selection.extend(focusNode, focusOffset);
+  // IE doesn't support selection.extend. This means that the selection
+  // won't return on IE.
+  if (selection.extend) {
+    selection.collapse(anchorNode, anchorOffset);
+    selection.extend(focusNode, focusOffset);
+  }
 
   copySource.parentNode.removeChild(copySource);
 };
@@ -6846,15 +12222,30 @@ hterm.Terminal.prototype.onMouse_ = function(e) {
 
   e.processedByTerminalHandler_ = true;
 
+  // One based row/column stored on the mouse event.
+  e.terminalRow = parseInt((e.clientY - this.scrollPort_.visibleRowTopMargin) /
+                           this.scrollPort_.characterSize.height) + 1;
+  e.terminalColumn = parseInt(e.clientX /
+                              this.scrollPort_.characterSize.width) + 1;
+
   if (e.type == 'mousedown' && e.terminalColumn > this.screenSize.width) {
     // Mousedown in the scrollbar area.
     return;
   }
 
-  e.terminalRow = parseInt((e.clientY - this.scrollPort_.visibleRowTopMargin) /
-                           this.scrollPort_.characterSize.height) + 1;
-  e.terminalColumn = parseInt(e.clientX /
-                              this.scrollPort_.characterSize.width) + 1;
+  if (this.options_.cursorVisible &&
+      this.vt.mouseReport == this.vt.MOUSE_REPORT_DISABLED) {
+    // If the cursor is visible and we're not sending mouse events to the
+    // host app, then we want to hide the terminal cursor when the mouse
+    // cursor is over top.  This keeps the terminal cursor from interfering
+    // with local text selection.
+    if (e.terminalRow - 1 == this.screen_.cursorPosition.row &&
+        e.terminalColumn - 1 == this.screen_.cursorPosition.column) {
+      this.cursorNode_.style.display = 'none';
+    } else if (this.cursorNode_.style.display == 'none') {
+      this.cursorNode_.style.display = '';
+    }
+  }
 
   if (e.type == 'mousedown') {
     if (e.altKey || this.vt.mouseReport == this.vt.MOUSE_REPORT_DISABLED) {
@@ -6865,7 +12256,7 @@ hterm.Terminal.prototype.onMouse_ = function(e) {
     } else {
       // Otherwise we defer ownership of the mouse to the VT.
       this.reportMouseEvents_ = true;
-      this.document_.getSelection().collapse();
+      this.document_.getSelection().collapseToEnd();
       this.setSelectionEnabled(false);
       e.preventDefault();
     }
@@ -6903,7 +12294,7 @@ hterm.Terminal.prototype.onMouse_ = function(e) {
       } else if (e.type == 'mousemove') {
         // Oh.  This means that drag-scroll was disabled AFTER the mouse down,
         // in which case it's too late to engage the scroll-blocker.
-        this.document_.getSelection().collapse();
+        this.document_.getSelection().collapseToEnd();
         e.preventDefault();
       }
     }
@@ -6931,9 +12322,11 @@ hterm.Terminal.prototype.onMouse = function(e) { };
 /**
  * React when focus changes.
  */
-hterm.Terminal.prototype.onFocusChange_ = function(state) {
-  this.cursorNode_.setAttribute('focus', state ? 'true' : 'false');
+hterm.Terminal.prototype.onFocusChange_ = function(focused) {
+  this.cursorNode_.setAttribute('focus', focused);
   this.restyleCursor_();
+  if (focused === true)
+    this.closeBellNotifications_();
 };
 
 /**
@@ -6947,16 +12340,22 @@ hterm.Terminal.prototype.onScroll_ = function() {
  * React when text is pasted into the scrollPort.
  */
 hterm.Terminal.prototype.onPaste_ = function(e) {
-  this.onVTKeystroke(e.text.replace(/\n/mg, '\r'));
+  var data = e.text.replace(/\n/mg, '\r');
+  data = this.keyboard.encode(data);
+  if (this.options_.bracketedPaste)
+    data = '\x1b[200~' + data + '\x1b[201~';
+
+  this.io.sendString(data);
 };
 
 /**
  * React when the user tries to copy from the scrollPort.
  */
 hterm.Terminal.prototype.onCopy_ = function(e) {
-  /* comment this line so that browser copies the selection */
-  // e.preventDefault();
-  setTimeout(this.copySelectionToClipboard.bind(this), 0);
+  if (!this.useDefaultWindowCopy) {
+    e.preventDefault();
+    setTimeout(this.copySelectionToClipboard.bind(this), 0);
+  }
 };
 
 /**
@@ -6970,7 +12369,7 @@ hterm.Terminal.prototype.onCopy_ = function(e) {
 hterm.Terminal.prototype.onResize_ = function() {
   var columnCount = Math.floor(this.scrollPort_.getScreenWidth() /
                                this.scrollPort_.characterSize.width);
-  var rowCount = Math.floor(this.scrollPort_.getScreenHeight() /
+  var rowCount = lib.f.smartFloorDivide(this.scrollPort_.getScreenHeight(),
                             this.scrollPort_.characterSize.height);
 
   if (columnCount <= 0 || rowCount <= 0) {
@@ -6999,11 +12398,20 @@ hterm.Terminal.prototype.onResize_ = function() {
  * Service the cursor blink timeout.
  */
 hterm.Terminal.prototype.onCursorBlink_ = function() {
+  if (!this.options_.cursorBlink) {
+    delete this.timeouts_.cursorBlink;
+    return;
+  }
+
   if (this.cursorNode_.getAttribute('focus') == 'false' ||
       this.cursorNode_.style.opacity == '0') {
     this.cursorNode_.style.opacity = '1';
+    this.timeouts_.cursorBlink = setTimeout(this.myOnCursorBlink_,
+                                            this.cursorBlinkCycle_[0]);
   } else {
     this.cursorNode_.style.opacity = '0';
+    this.timeouts_.cursorBlink = setTimeout(this.myOnCursorBlink_,
+                                            this.cursorBlinkCycle_[1]);
   }
 };
 
@@ -7019,6 +12427,28 @@ hterm.Terminal.prototype.onCursorBlink_ = function() {
  */
 hterm.Terminal.prototype.setScrollbarVisible = function(state) {
   this.scrollPort_.setScrollbarVisible(state);
+};
+
+/**
+ * Set the scroll wheel move multiplier.  This will affect how fast the page
+ * scrolls on mousewheel events.
+ *
+ * Defaults to 1.
+ *
+ * @param {number} multiplier.
+ */
+hterm.Terminal.prototype.setScrollWheelMoveMultipler = function(multiplier) {
+  this.scrollPort_.setScrollWheelMoveMultipler(multiplier);
+};
+
+/**
+ * Close all web notifications created by terminal bells.
+ */
+hterm.Terminal.prototype.closeBellNotifications_ = function() {
+  this.bellNotificationList_.forEach(function(n) {
+      n.close();
+    });
+  this.bellNotificationList_.length = 0;
 };
 // SOURCE FILE: hterm/js/hterm_terminal_io.js
 // Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
@@ -7230,7 +12660,7 @@ lib.rtdep('lib.colors');
  * Constructor for TextAttribute objects.
  *
  * These objects manage a set of text attributes such as foreground/
- * background color, bold, italic, blink and underline.
+ * background color, bold, faint, italic, blink, underline, and strikethrough.
  *
  * TextAttribute instances can be used to construct a DOM container implementing
  * the current attributes, or to test an existing DOM container for
@@ -7242,11 +12672,15 @@ lib.rtdep('lib.colors');
  */
 hterm.TextAttributes = function(document) {
   this.document_ = document;
-  this.foregroundIndex = null;
-  this.backgroundIndex = null;
+  // These variables contain the source of the color as either:
+  // SRC_DEFAULT  (use context default)
+  // SRC_RGB      (specified in 'rgb( r, g, b)' form)
+  // number       (representing the index from color palette to use)
+  this.foregroundSource = this.SRC_DEFAULT;
+  this.backgroundSource = this.SRC_DEFAULT;
 
-  // These properties cache the value in the color table, but foregroundIndex
-  // and backgroundIndex contain the canonical values.
+  // These properties cache the value in the color table, but foregroundSource
+  // and backgroundSource contain the canonical values.
   this.foreground = this.DEFAULT_COLOR;
   this.background = this.DEFAULT_COLOR;
 
@@ -7254,11 +12688,15 @@ hterm.TextAttributes = function(document) {
   this.defaultBackground = 'rgb(0, 0, 0)';
 
   this.bold = false;
+  this.faint = false;
+  this.italic = false;
   this.blink = false;
   this.underline = false;
+  this.strikethrough = false;
   this.inverse = false;
   this.invisible = false;
   this.wcNode = false;
+  this.tileData = null;
 
   this.colorPalette = null;
   this.resetColorPalette();
@@ -7283,6 +12721,18 @@ hterm.TextAttributes.prototype.enableBoldAsBright = true;
  * A sentinel constant meaning "whatever the default color is in this context".
  */
 hterm.TextAttributes.prototype.DEFAULT_COLOR = new String('');
+
+/**
+ * A constant string used to specify that source color is context default.
+ */
+hterm.TextAttributes.prototype.SRC_DEFAULT = 'default';
+
+
+/**
+ * A constant string used to specify that the source of a color is a valid
+ * rgb( r, g, b) specifier.
+ */
+hterm.TextAttributes.prototype.SRC_RGB = 'rgb';
 
 /**
  * The document object which should own the DOM nodes created by this instance.
@@ -7313,15 +12763,19 @@ hterm.TextAttributes.prototype.clone = function() {
  * Reset the current set of attributes.
  *
  * This does not affect the palette.  Use resetColorPalette() for that.
+ * It also doesn't affect the tile data, it's not meant to.
  */
 hterm.TextAttributes.prototype.reset = function() {
-  this.foregroundIndex = null;
-  this.backgroundIndex = null;
+  this.foregroundSource = this.SRC_DEFAULT;
+  this.backgroundSource = this.SRC_DEFAULT;
   this.foreground = this.DEFAULT_COLOR;
   this.background = this.DEFAULT_COLOR;
   this.bold = false;
+  this.faint = false;
+  this.italic = false;
   this.blink = false;
   this.underline = false;
+  this.strikethrough = false;
   this.inverse = false;
   this.invisible = false;
   this.wcNode = false;
@@ -7341,14 +12795,18 @@ hterm.TextAttributes.prototype.resetColorPalette = function() {
  * @return {boolean} True if the current attributes describe unstyled text.
  */
 hterm.TextAttributes.prototype.isDefault = function() {
-  return (this.foregroundIndex == null &&
-          this.backgroundIndex == null &&
+  return (this.foregroundSource == this.SRC_DEFAULT &&
+          this.backgroundSource == this.SRC_DEFAULT &&
           !this.bold &&
+          !this.faint &&
+          !this.italic &&
           !this.blink &&
           !this.underline &&
+          !this.strikethrough &&
           !this.inverse &&
           !this.invisible &&
-          !this.wcNode);
+          !this.wcNode &&
+          this.tileData == null);
 };
 
 /**
@@ -7359,6 +12817,8 @@ hterm.TextAttributes.prototype.isDefault = function() {
  * an HTML span if the text is styled.  Due to lack of monospace wide character
  * fonts on certain systems (e.g. Chrome OS), we need to put each wide character
  * in a span of CSS class '.wc-node' which has double column width.
+ * Each vt_tiledata tile is also represented by a span with a single
+ * character, with CSS classes '.tile' and '.tile_<glyph number>'.
  *
  * @param {string} opt_textContent Optional text content for the new container.
  * @return {HTMLNode} An HTML span or text nodes styled to match the current
@@ -7374,26 +12834,43 @@ hterm.TextAttributes.prototype.createContainer = function(opt_textContent) {
   if (this.foreground != this.DEFAULT_COLOR)
     style.color = this.foreground;
 
-  if (this.background != this.DEFAULT_COLOR) {
+  if (this.background != this.DEFAULT_COLOR)
     style.backgroundColor = this.background;
-    // This bottom border ensures that the extra row of pixels at the bottom of
-    // the character cell (used to hold underscores in some fonts) has the
-    // correct background color.
-    style.borderBottom = '1px ' + this.background + ' solid';
-  }
 
   if (this.enableBold && this.bold)
     style.fontWeight = 'bold';
 
+  if (this.faint)
+    span.faint = true;
+
+  if (this.italic)
+    style.fontStyle = 'italic';
+
   if (this.blink)
     style.fontStyle = 'italic';
 
-  if (this.underline)
-    style.textDecoration = 'underline';
+  var textDecoration = '';
+  if (this.underline) {
+    textDecoration += ' underline';
+    span.underline = true;
+  }
+  if (this.strikethrough) {
+    textDecoration += ' line-through';
+    span.strikethrough = true;
+  }
+  if (textDecoration) {
+    style.textDecoration = textDecoration;
+  }
 
   if (this.wcNode) {
     span.className = 'wc-node';
     span.wcNode = true;
+  }
+
+  if (this.tileData != null) {
+    // This could be a wcNode too, so we add to the className here.
+    span.className += ' tile tile_' + this.tileData;
+    span.tileNode = true;
   }
 
   if (opt_textContent)
@@ -7421,14 +12898,16 @@ hterm.TextAttributes.prototype.matchesContainer = function(obj) {
 
   var style = obj.style;
 
-  // We don't want to put multiple wide characters in a wcNode. See the comment
-  // in createContainer.
+  // We don't want to put multiple characters in a wcNode or a tile.
+  // See the comments in createContainer.
   return (!(this.wcNode || obj.wcNode) &&
+          !(this.tileData != null || obj.tileNode) &&
           this.foreground == style.color &&
           this.background == style.backgroundColor &&
           (this.enableBold && this.bold) == !!style.fontWeight &&
-          this.blink == !!style.fontStyle &&
-          this.underline == !!style.textDecoration);
+          (this.blink || this.italic) == !!style.fontStyle &&
+          !!this.underline == !!obj.underline &&
+          !!this.strikethrough == !!obj.strikethrough);
 };
 
 hterm.TextAttributes.prototype.setDefaults = function(foreground, background) {
@@ -7460,31 +12939,47 @@ hterm.TextAttributes.prototype.syncColors = function() {
     return i;
   }
 
-  var foregroundIndex = this.foregroundIndex;
-  var backgroundIndex = this.backgroundIndex;
+  var foregroundSource = this.foregroundSource;
+  var backgroundSource = this.backgroundSource;
   var defaultForeground = this.DEFAULT_COLOR;
   var defaultBackground = this.DEFAULT_COLOR;
 
   if (this.inverse) {
-    foregroundIndex = this.backgroundIndex;
-    backgroundIndex = this.foregroundIndex;
+    foregroundSource = this.backgroundSource;
+    backgroundSource = this.foregroundSource;
     // We can't inherit the container's color anymore.
     defaultForeground = this.defaultBackground;
     defaultBackground = this.defaultForeground;
   }
 
   if (this.enableBoldAsBright && this.bold) {
-    if (foregroundIndex != null)
-      foregroundIndex = getBrightIndex(foregroundIndex);
+    if (foregroundSource != this.SRC_DEFAULT &&
+        foregroundSource != this.SRC_RGB) {
+      foregroundSource = getBrightIndex(foregroundSource);
+    }
   }
 
-  if (this.invisible)
-    foregroundIndex = backgroundIndex;
+  if (this.invisible) {
+    foregroundSource = backgroundSource;
+    defaultForeground = this.defaultBackground;
+  }
 
-  this.foreground = ((foregroundIndex == null) ? defaultForeground :
-                     this.colorPalette[foregroundIndex]);
-  this.background = ((backgroundIndex == null) ? defaultBackground :
-                     this.colorPalette[backgroundIndex]);
+  // Set fore/background colors unless already specified in rgb(r, g, b) form.
+  if (foregroundSource != this.SRC_RGB) {
+    this.foreground = ((foregroundSource == this.SRC_DEFAULT) ?
+                       defaultForeground : this.colorPalette[foregroundSource]);
+  }
+
+  if (this.faint && !this.invisible) {
+    var colorToMakeFaint = ((this.foreground == this.DEFAULT_COLOR) ?
+                            this.defaultForeground : this.foreground);
+    this.foreground = lib.colors.mix(colorToMakeFaint, 'rgb(0, 0, 0)', 0.3333);
+  }
+
+  if (backgroundSource != this.SRC_RGB) {
+    this.background = ((backgroundSource == this.SRC_DEFAULT) ?
+                       defaultBackground : this.colorPalette[backgroundSource]);
+  }
 };
 
 /**
@@ -8377,7 +13872,7 @@ hterm.VT.prototype.setANSIMode = function(code, state) {
  *   1053 - [x] Set SCO function-key mode.
  *   1060 - [x] Set legacy keyboard emulation (X11R6).
  *   1061 - [!] Set VT220 keyboard emulation.
- *   2004 - [!] Set bracketed paste mode.
+ *   2004 - Set bracketed paste mode.
  *
  * [!] - Not currently implemented, may be in the future.
  * [x] - Will not implement.
@@ -8453,7 +13948,17 @@ hterm.VT.prototype.setDECMode = function(code, state) {
       break;
 
     case '1039':  // no-spec
-      this.terminal.keyboard.altSendsEscape = state;
+      if (state) {
+        if (!this.terminal.keyboard.previousAltSendsWhat_) {
+          this.terminal.keyboard.previousAltSendsWhat_ =
+              this.terminal.keyboard.altSendsWhat;
+          this.terminal.keyboard.altSendsWhat = 'escape';
+        }
+      } else if (this.terminal.keyboard.previousAltSendsWhat_) {
+        this.terminal.keyboard.altSendsWhat =
+            this.terminal.keyboard.previousAltSendsWhat_;
+        this.terminal.keyboard.previousAltSendsWhat_ = null;
+      }
       break;
 
     case '47':
@@ -8474,6 +13979,10 @@ hterm.VT.prototype.setDECMode = function(code, state) {
         this.savedState_.restore();
       }
 
+      break;
+
+    case '2004':  // Bracketed paste mode.
+      this.terminal.setBracketedPaste(state);
       break;
 
     default:
@@ -9218,7 +14727,7 @@ hterm.VT.OSC['52'] = function(parseState) {
   // Args come in as a single 'clipboard;b64-data' string.  The clipboard
   // parameter is used to select which of the X clipboards to address.  Since
   // we're not integrating with X, we treat them all the same.
-  var args = parseState.args[0].match(/^[cps01234567]+;(.*)/);
+  var args = parseState.args[0].match(/^[cps01234567]*;(.*)/);
   if (!args)
     return;
 
@@ -9540,15 +15049,20 @@ hterm.VT.CSI['?l'] = function(parseState) {
  *
  *    0 Normal (default).
  *    1 Bold.
+ *    2 Faint.
+ *    3 Italic (non-xterm).
  *    4 Underlined.
  *    5 Blink (appears as Bold).
  *    7 Inverse.
  *    8 Invisible, i.e., hidden (VT300).
+ *    9 Crossed out (ECMA-48).
  *   22 Normal (neither bold nor faint).
+ *   23 Not italic (non-xterm).
  *   24 Not underlined.
  *   25 Steady (not blinking).
  *   27 Positive (not inverse).
  *   28 Visible, i.e., not hidden (VT300).
+ *   29 Not crossed out (ECMA-48).
  *   30 Set foreground color to Black.
  *   31 Set foreground color to Red.
  *   32 Set foreground color to Green.
@@ -9567,6 +15081,10 @@ hterm.VT.CSI['?l'] = function(parseState) {
  *   46 Set background color to Cyan.
  *   47 Set background color to White.
  *   49 Set background color to default (original)
+ *
+ * Non-xterm (italic) codes have mixed support, but are supported by both
+ * gnome-terminal and rxvt and are recognized as CSI codes on Wikipedia
+ * (http://en.wikipedia.org/wiki/ANSI_escape_code).
  *
  * For 16-color support, the following apply.
  *
@@ -9591,6 +15109,10 @@ hterm.VT.CSI['?l'] = function(parseState) {
  *  38 ; 5 ; P Set foreground color to P.
  *  48 ; 5 ; P Set background color to P.
  *
+ *  For true color (24-bit) support, the following apply.
+ *  38 ; 2 ; R ; G ; B Set foreground color to rgb(R, G, B)
+ *  48 ; 2 ; R ; G ; B Set background color to rgb(R, G, B)
+ *
  * Note that most terminals consider "bold" to be "bold and bright".  In
  * some documents the bold state is even referred to as bright.  We interpret
  * bold as bold-bright here too, but only when the "bold" setting comes before
@@ -9602,6 +15124,16 @@ hterm.VT.CSI['m'] = function(parseState) {
       return null;
 
     return parseState.iarg(i + 2, 0);
+  }
+
+  function getTrueColor(i) {
+    if (parseState.args.length < i + 5 || parseState.args[i + 1] != '2')
+      return null;
+    var r = parseState.iarg(i + 2, 0);
+    var g = parseState.iarg(i + 3, 0);
+    var b = parseState.iarg(i + 4, 0);
+
+    return 'rgb(' + r + ' ,' + g + ' ,' + b + ')';
   }
 
   var attrs = this.terminal.getTextAttributes();
@@ -9619,6 +15151,10 @@ hterm.VT.CSI['m'] = function(parseState) {
         attrs.reset();
       } else if (arg == 1) {
         attrs.bold = true;
+      } else if (arg == 2) {
+        attrs.faint = true;
+      } else if (arg == 3) {
+        attrs.italic = true;
       } else if (arg == 4) {
         attrs.underline = true;
       } else if (arg == 5) {
@@ -9627,8 +15163,13 @@ hterm.VT.CSI['m'] = function(parseState) {
         attrs.inverse = true;
       } else if (arg == 8) {  // Invisible.
         attrs.invisible = true;
+      } else if (arg == 9) {
+        attrs.strikethrough = true;
       } else if (arg == 22) {
         attrs.bold = false;
+        attrs.faint = false;
+      } else if (arg == 23) {
+        attrs.italic = false;
       } else if (arg == 24) {
         attrs.underline = false;
       } else if (arg == 25) {
@@ -9637,52 +15178,75 @@ hterm.VT.CSI['m'] = function(parseState) {
         attrs.inverse = false;
       } else if (arg == 28) {
         attrs.invisible = false;
+      } else if (arg == 29) {
+        attrs.strikethrough = false;
       }
 
     } else if (arg < 50) {
       // Select fore/background color from bottom half of 16 color palette
-      // or from the 256 color palette.
+      // or from the 256 color palette or alternative specify color in fully
+      // qualified rgb(r, g, b) form.
       if (arg < 38) {
-        attrs.foregroundIndex = arg - 30;
+        attrs.foregroundSource = arg - 30;
 
       } else if (arg == 38) {
-        var c = get256(i);
-        if (c == null)
-          break;
+        // First check for true color definition
+        var trueColor = getTrueColor(i);
+        if (trueColor != null) {
+          attrs.foregroundSource = attrs.SRC_RGB;
+          attrs.foreground = trueColor;
 
-        i += 2;
+          i += 5;
+        } else {
+          // Check for 256 color
+          var c = get256(i);
+          if (c == null)
+            break;
 
-        if (c >= attrs.colorPalette.length)
-          continue;
+          i += 2;
 
-        attrs.foregroundIndex = c;
+          if (c >= attrs.colorPalette.length)
+            continue;
+
+          attrs.foregroundSource = c;
+        }
 
       } else if (arg == 39) {
-        attrs.foregroundIndex = null;
+        attrs.foregroundSource = attrs.SRC_DEFAULT;
 
       } else if (arg < 48) {
-        attrs.backgroundIndex = arg - 40;
+        attrs.backgroundSource = arg - 40;
 
       } else if (arg == 48) {
-        var c = get256(i);
-        if (c == null)
-          break;
+        // First check for true color definition
+        var trueColor = getTrueColor(i);
+        if (trueColor != null) {
+          attrs.backgroundSource = attrs.SRC_RGB;
+          attrs.background = trueColor;
 
-        i += 2;
+          i += 5;
+        } else {
+          // Check for 256 color
+          var c = get256(i);
+          if (c == null)
+            break;
 
-        if (c >= attrs.colorPalette.length)
-          continue;
+          i += 2;
 
-        attrs.backgroundIndex = c;
+          if (c >= attrs.colorPalette.length)
+            continue;
+
+          attrs.backgroundSource = c;
+        }
       } else {
-        attrs.backgroundIndex = null;
+        attrs.backgroundSource = attrs.SRC_DEFAULT;
       }
 
     } else if (arg >= 90 && arg <= 97) {
-      attrs.foregroundIndex = arg - 90 + 8;
+      attrs.foregroundSource = arg - 90 + 8;
 
     } else if (arg >= 100 && arg <= 107) {
-      attrs.backgroundIndex = arg - 100 + 8;
+      attrs.backgroundSource = arg - 100 + 8;
     }
   }
 
@@ -9902,7 +15466,7 @@ hterm.VT.CSI[' t'] = hterm.VT.ignore;
  * Restore cursor (ANSI.SYS).
  */
 hterm.VT.CSI['u'] = function() {
-  this.terminal.restoreOptions();
+  this.savedState_.restore();
 };
 
 /**
@@ -9946,6 +15510,27 @@ hterm.VT.CSI['*x'] = hterm.VT.ignore;
  * Will not implement.
  */
 hterm.VT.CSI['$x'] = hterm.VT.ignore;
+
+/**
+ * vt_tiledata (as used by NAOhack and UnNetHack)
+ * (see http://nethackwiki.com/wiki/Vt_tiledata for more info)
+ *
+ * Implemented as far as we care (start a glyph and end a glyph).
+ */
+hterm.VT.CSI['z'] = function(parseState) {
+  if (parseState.args.length < 1)
+    return;
+  var arg = parseState.args[0];
+  if (arg == '0') {
+    // Start a glyph (one parameter, the glyph number).
+    if (parseState.args.length < 2)
+      return;
+    this.terminal.getTextAttributes().tileData = parseState.args[1];
+  } else if (arg == '1') {
+    // End a glyph.
+    this.terminal.getTextAttributes().tileData = null;
+  }
+};
 
 /**
  * Enable Locator Reporting (DECELR).
@@ -10461,22 +16046,22 @@ lib.resource.add('hterm/audio/bell', 'audio/ogg;base64',
 );
 
 lib.resource.add('hterm/concat/date', 'text/plain',
-'Fri, 28 Mar 2014 15:50:05 +0000' +
+'Fri, 03 Apr 2015 09:02:15 +0000' +
 ''
 );
 
 lib.resource.add('hterm/changelog/version', 'text/plain',
-'1.35' +
+'1.54' +
 ''
 );
 
 lib.resource.add('hterm/changelog/date', 'text/plain',
-'2014-03-25' +
+'2015-03-19' +
 ''
 );
 
 lib.resource.add('hterm/git/HEAD', 'text/plain',
-'e1883c2670d32ee4e394b3a6d1e1c18de47f036f' +
+'5db5b0ceefff97ce8b7a97edd3f5ba6857db54cf' +
 ''
 );
 

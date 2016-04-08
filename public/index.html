@@ -4,21 +4,20 @@
 <head>
     <meta charset="UTF-8">
     <title>Wetty - The WebTTY Terminal Emulator</title>
-    <script src="/wetty/hterm_all.js"></script>
-    <script src="/wetty/hterm.js"></script>
-    <script src="/wetty/wetty.js"></script>
+    <script src="/js/hterm_all.js"></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/js/wetty.js"></script>
+    <script type="text/javascript">
+      window.onbeforeunload = function() {
+        return "Are you sure? Leaving this page will clear your agent node session.";
+      }
+    </script>
     <style>
         html,
         body {
             height: 100%;
             width: 100%;
             margin: 0px;
-        }
-        #terminal {
-            display: block;
-            position: relative;
-            width: 100%;
-            height: 100%;
         }
     </style>
 </head>
