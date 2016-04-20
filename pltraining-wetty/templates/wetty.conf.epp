@@ -1,0 +1,11 @@
+[Unit]
+Description=Wetty web based terminal
+After=syslog.target network.target
+
+[Service]
+PIDFile=/var/spool/wetty/pid/master.pid
+ExecStart=/usr/local/node/node-default/bin/wetty -p <%= $port %> -c <%= $command %> >> /var/log/wetty.log
+
+[Install]
+WantedBy=multi-user.target
+

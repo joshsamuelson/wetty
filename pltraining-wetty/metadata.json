@@ -1,0 +1,30 @@
+{
+  "operatingsystem_support": [
+    {
+      "operatingsystem": "CentOS",
+      "operatingsystemrelease": [ "7.0" ]
+    }
+  ],
+  "requirements": [
+    {
+      "name": "pe",
+      "version_requirement": "2016.1.x"
+    },
+    {
+      "name": "puppet",
+      "version_requirement": "4.x"
+    }
+  ],
+  "name": "pltraining-wetty",
+  "version": "0.0.1",
+  "author": "pltraining",
+  "summary": "Provides a web based terminal",
+  "license": "Apache 2.0",
+  "source": "https://github.com/puppetlabs/wetty",
+  "project_page": "https://github.com/puppetlabs/wetty",
+  "issues_url": "https://github.com/puppetlabs/wetty",
+  "description": "Wetty is a web based terminal using websockets. It can be configured to give a login prompt or to run arbitrary commands.",
+  "dependencies": [
+    {"name":"willdurand/nodejs","version_requirement":">=1.9.3"}
+  ]
+}
